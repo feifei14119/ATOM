@@ -199,7 +199,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.dtype_kv,
                 is_sparse=True,
                 fast_mode=True,
-                max_split_per_batch=16
+                max_split_per_batch=16,
             )
             mla_metadata["sparse_mtp_work_meta_data"] = torch.empty(
                 smt_wmd_size, dtype=smt_wmd_type, device=self.device

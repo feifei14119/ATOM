@@ -1019,7 +1019,7 @@ class MLAAttention(nn.Module):
                 paged_kv_last_page_lens,
                 max_q_len,
                 page_size=page_size,
-                num_kv_splits=1,  # asm passes
+                num_kv_splits=None,  # asm passes
                 sm_scale=self.scale,
                 work_meta_data=work_meta_data,
                 work_indptr=work_indptr,

@@ -30,10 +30,12 @@ logger = logging.getLogger("atom")
 # `max_split_per_batch` is only needed (and only exists in newer aiter builds)
 # for the segmented page_size>1 MLA path. Detect support once so the default
 # page_size=1 path never passes an unsupported kwarg.
-_MLA_META_SUPPORTS_MAX_SPLIT = (
-    "max_split_per_batch"
-    in inspect.signature(get_mla_metadata_info_v1).parameters
-)
+try:
+    _MLA_META_SUPPORTS_MAX_SPLIT = (
+        "max_split_per_batch" in inspect.signature(get_mla_metadata_info_v1).parameters
+    )
+except (TypeError, ValueError):
+    _MLA_META_SUPPORTS_MAX_SPLIT = False
 
 
 def _mla_seg_meta_kwargs() -> dict:

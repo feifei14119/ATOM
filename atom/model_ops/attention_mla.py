@@ -251,16 +251,27 @@ class MLAAttention(nn.Module):
         # ==1 falls back to the original interleaved per-token (page_size=1)
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
-        if self.use_seg_mla and (
-            concat_and_cache_mla_seg is None
-            or fused_qk_rope_concat_and_cache_mla_seg is None
-        ):
-            raise RuntimeError(
-                "ATOM_MLA_PAGE_SIZE > 1 requires the segmented MLA kernels "
-                "(concat_and_cache_mla_seg / fused_qk_rope_concat_and_cache_mla_seg), "
-                "which are not available in the installed aiter build. Upgrade "
-                "aiter or set ATOM_MLA_PAGE_SIZE=1."
-            )
+        if self.use_seg_mla:
+            if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
+                raise RuntimeError(
+                    f"Segmented MLA requires ATOM_MLA_PAGE_SIZE={_MLA_SEG_PAGE_SIZE} "
+                    f"(got {envs.ATOM_MLA_PAGE_SIZE})."
+                )
+            if get_current_atom_config().kv_cache_block_size != _MLA_SEG_PAGE_SIZE:
+                raise RuntimeError(
+                    f"Segmented MLA requires kv_cache_block_size={_MLA_SEG_PAGE_SIZE} "
+                    f"(got {get_current_atom_config().kv_cache_block_size})."
+                )
+            if (
+                concat_and_cache_mla_seg is None
+                or fused_qk_rope_concat_and_cache_mla_seg is None
+            ):
+                raise RuntimeError(
+                    "ATOM_MLA_PAGE_SIZE > 1 requires the segmented MLA kernels "
+                    "(concat_and_cache_mla_seg / fused_qk_rope_concat_and_cache_mla_seg), "
+                    "which are not available in the installed aiter build. Upgrade "
+                    "aiter or set ATOM_MLA_PAGE_SIZE=1."
+                )
 
     def _seg_kv_cache_view(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Reshape the KV cache buffer into the page-level flat seg layout
@@ -1052,7 +1063,7 @@ class MLAAttention(nn.Module):
                 page_size=page_size,
                 # The seg/asm decode path runs with a single kv split; the
                 # original (page_size=1) persistent path keeps 16 splits.
-                num_kv_splits=1 if self.use_seg_mla else 16,
+                num_kv_splits=None if self.use_seg_mla else 16,
                 sm_scale=self.scale,
                 work_meta_data=work_meta_data,
                 work_indptr=work_indptr,

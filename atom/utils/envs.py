@@ -176,6 +176,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_FWD_DUMP_LAYER_ATTR", "layer_id"
     ),
     "ATOM_FWD_DUMP_ONE_SHOT": lambda: os.getenv("ATOM_FWD_DUMP_ONE_SHOT", "1") == "1",
+    # --- MLA decode dump (atom/model_ops/mla_dump.py) ---
+    # When ATOM_DUMP_MLA_DIR is set, the triton MLA decode path dumps, per call:
+    #   1. a JSONL manifest line (shapes/params: ctx_lens, nhead, batch, ...) to
+    #      <dir>/mla_calls.rank<r>.jsonl  -- always recorded (cheap).
+    #   2. up to ATOM_DUMP_MLA_MAX full input/output tensor files (compact
+    #      token-major fp8 KV + fp8 Q + kernel output) to
+    #      <dir>/mla_decode.rank<r>.<idx>.pt -- so an aiter unit test can replay
+    #      the exact kernel inputs (triton-vs-aiter golden compare).
+    # Disabled (empty) by default; safe to leave wired in production.
+    "ATOM_DUMP_MLA_DIR": lambda: os.getenv("ATOM_DUMP_MLA_DIR", ""),
+    # Max number of full-tensor dumps per process (params manifest is unbounded).
+    "ATOM_DUMP_MLA_MAX": lambda: int(os.getenv("ATOM_DUMP_MLA_MAX", "8") or "8"),
+    # Comma-separated layer ids to dump (empty = all MLA layers).
+    "ATOM_DUMP_MLA_LAYERS": lambda: os.getenv("ATOM_DUMP_MLA_LAYERS", ""),
     # Per-rank weight dump + sys.exit(0) — for byte-equal weight comparison.
     "ATOM_WEIGHT_DUMP_DIR": lambda: os.getenv("ATOM_WEIGHT_DUMP_DIR", ""),
     "ATOM_WEIGHT_DUMP_LAYERS": lambda: os.getenv("ATOM_WEIGHT_DUMP_LAYERS", "0"),

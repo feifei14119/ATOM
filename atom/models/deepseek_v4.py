@@ -94,6 +94,7 @@ from atom.model_ops.v4_kernels import (
     swa_write,
     update_compressor_states,
 )
+from atom.model_ops.mla_dump import dump_v4_sparse_decode, mla_dump_enabled
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
@@ -1881,6 +1882,21 @@ class DeepseekV4Attention(nn.Module):
                 self.attn_sink,
                 self.softmax_scale,
             )  # [S, H, head_dim]
+            if mla_dump_enabled():
+                # Dump the EXACT V4 sparse decode inputs + ATOM triton output
+                # (== golden) for the aiter pa_decode_sparse unit test. Must run
+                # BEFORE the in-place inverse RoPE below mutates o.
+                dump_v4_sparse_decode(
+                    layer_id=self.layer_id,
+                    ratio=ratio,
+                    q=q_sa,
+                    unified_kv=self.unified_kv,
+                    kv_indices=kv_indices,
+                    kv_indptr=kv_indptr,
+                    attn_sink=self.attn_sink,
+                    softmax_scale=self.softmax_scale,
+                    o=o,
+                )
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
             # buffer with SWA history + compress section), extend from per-fwd

@@ -15,7 +15,10 @@ from atom.utils.block_convert import (
     kv_indices_generate_triton,
 )
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
-from atom.utils.forward_context import AttentionMetaData, Context
+from atom.utils.forward_context import (
+    AttentionMetaData,
+    Context,
+)
 from atom.utils.tbo import TokenSplitPrefillState
 
 from .backends import AttentionBackend, CommonAttentionBuilder
@@ -25,6 +28,19 @@ logger = logging.getLogger("atom")
 
 def cdiv(a, b):
     return (a + b - 1) // b
+
+
+def _is_indexed_sparse_attention(module) -> bool:
+    """True only for the MiniMax-M3 sparse ``Attention`` layer (the one that owns
+    the sparse impl), so binding reads ``module.impl``.
+
+    ``model.modules()`` walks both the outer ``MiniMaxM3SparseAttention`` wrapper
+    AND its child ``Attention`` layer. Only the child carries ``.impl`` (a
+    ``SparseMHAPagedAttentionImpl``) and the KV-cache slot; the wrapper must be
+    skipped (return None from build_kv_cache_tensor). So key off the impl flag,
+    NOT the wrapper's own ``is_indexed_sparse_attention`` class attribute."""
+    impl = getattr(module, "impl", None)
+    return bool(getattr(impl, "is_indexed_sparse_attention", False))
 
 
 class AiterBackend(AttentionBackend):
@@ -499,23 +515,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         from atom.config import KVCacheTensor
         from aiter import dtypes
 
-        if getattr(module, "is_indexed_sparse_attention", False):
+        if _is_indexed_sparse_attention(module):
+            # MiniMax-M3 sparse attention. The KV cache uses the SAME allocation
+            # and binding as standard MHA — we only additionally bind the separate
+            # indexer-key cache here, then fall through to the standard branch for
+            # all K/V + scale binding (it sets module.k_cache/v_cache/k_scale/
+            # v_scale and returns the KVCacheTensor). The standard binding is
+            # page-128 SHUFFLE; SparseMHAPagedAttentionImpl.rope_cache re-views it
+            # to page-16 SHUFFLE (zero-copy) at attention time. index_cache is a
+            # genuinely separate cache (not derivable from the KV cache), so the
+            # runner assigns each sparse layer its own slice here.
             runner = self.model_runner
-            config = runner.config
             sparse_idx = runner._sparse_attention_cache_next
             runner._sparse_attention_cache_next += 1
-            key_cache, value_cache = module.bind_kv_cache(
-                runner.kv_cache[:, layer_id],
-                runner.sparse_attention_index_cache[sparse_idx],
-                config.max_model_len,
-            )
-            return KVCacheTensor(
-                layer_num=layer_id,
-                k_cache=key_cache,
-                v_cache=value_cache,
-                k_scale=None,
-                v_scale=None,
-            )
+            module.impl.index_cache = runner.sparse_attention_index_cache[sparse_idx]
+            module.impl.max_model_len = runner.config.max_model_len
+            # NOTE: no return — fall through to the standard MHA binding below.
 
         if not (
             hasattr(module, "base_attention")
@@ -717,6 +732,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=attn_metadata.max_seqlen_q,
                 max_seq_len=attn_metadata.max_seqlen_k,
                 num_prefills=bs,
+                num_prefill_tokens=batch.total_tokens_num_prefill,
             )
         if self._tbo_token_split:
             self._stash_tbo_token_split_prefill_state(batch)
@@ -917,10 +933,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 make_sparse_decode_metadata,
             )
 
-            if max_seqlen_q > 1:
-                raise NotImplementedError(
-                    "MiniMax-M3 FP4-only support does not include speculative decode."
-                )
+            # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
+            # the DECODE sparse path; the decode kernels handle q>1 per-token
+            # causal internally via max_query_len.
             sparse_block_tables = self._get_sparse_attention_block_tables(
                 attn_metadata.block_tables[:scheduled_bs],
                 attn_metadata.context_lens[:scheduled_bs],
@@ -931,6 +946,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 block_table=sparse_block_tables,
                 slot_mapping=attn_metadata.slot_mapping,
                 max_seq_len=int(max_seqlen_k),
+                max_query_len=int(max_seqlen_q),
             )
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, max_seqlen_q
@@ -1128,10 +1144,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
 
             seq_lens = attn_metadata.context_lens
-            if max_q_len > 1:
-                raise NotImplementedError(
-                    "MiniMax-M3 FP4-only support does not include speculative decode."
-                )
+            # Both plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) use
+            # the DECODE sparse path; the decode kernels handle q>1 per-token causal
+            # internally (max_query_len), so no separate prefill graph is needed.
             sparse_block_tables = self._get_sparse_attention_block_tables(
                 attn_metadata.block_tables,
                 seq_lens,
@@ -1142,6 +1157,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 block_table=sparse_block_tables,
                 slot_mapping=attn_metadata.slot_mapping,
                 max_seq_len=attn_metadata.max_seqlen_k,
+                max_query_len=max_q_len,
             )
 
         positions = var["positions"].copy_to_gpu(total_tokens)

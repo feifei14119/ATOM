@@ -177,6 +177,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_FWD_DUMP_ONE_SHOT": lambda: os.getenv("ATOM_FWD_DUMP_ONE_SHOT", "1") == "1",
     # --- MLA decode dump (atom/model_ops/mla_dump.py) ---
+    # Shared by the V4 sparse decode dump (dump_v4_sparse_decode) and the V3
+    # dense decode dump (dump_v3_dense_decode, ATOM_USE_TRITON_MLA triton path).
     # When ATOM_DUMP_MLA_DIR is set, the triton MLA decode path dumps, per call:
     #   1. a JSONL manifest line (shapes/params: ctx_lens, nhead, batch, ...) to
     #      <dir>/mla_calls.rank<r>.jsonl  -- always recorded (cheap).

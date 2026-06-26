@@ -41,6 +41,7 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
+from atom.model_ops.mla_dump import dump_v3_dense_decode, mla_dump_enabled
 from atom.model_ops.utils import get_and_maybe_dequant_weights
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -992,6 +993,26 @@ class MLAAttention(nn.Module):
                 k_scale=self._k_scale,
                 v_scale=self._k_scale,
             )
+            if mla_dump_enabled():
+                # Dump the EXACT V3 dense decode inputs + ATOM triton output
+                # (== golden) for the aiter mla_decode_fwd unit test. ``o`` is
+                # consumed in-place by _v_up_proj_and_o_proj below, so dump now
+                # while it still holds the raw decode_attention_fwd output.
+                dump_v3_dense_decode(
+                    layer_id=self.layer_num,
+                    q=q_for_triton,
+                    kv_cache=kv_c_and_k_pe_cache,
+                    block_table=attn_metadata.triton_block_table,
+                    context_lens=attn_metadata.context_lens,
+                    sm_scale=self.scale,
+                    page_size=page_size,
+                    num_kv_splits=4,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    o=o,
+                    k_scale=self._k_scale,
+                    v_scale=self._k_scale,
+                )
         else:
             kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
             paged_cu_seqlens_q = attn_metadata.cu_seqlens_q

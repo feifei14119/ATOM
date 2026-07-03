@@ -62,6 +62,29 @@ from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
 
+
+@functools.lru_cache(maxsize=None)
+def _v4_decode_const_indices(
+    n: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token paged-decode index tensors that depend only on N.
+
+    ``qo_indptr = arange(N+1)`` and ``kv_last_page_lens = ones(N)`` are pure
+    functions of the token count N (fixed per CUDAGraph batch size), so build
+    them once per (N, device) and reuse the same buffers across every layer and
+    every decode step instead of re-allocating on each call. Values are
+    constant and the decode kernel treats them as read-only (indptr / per-token
+    last-page lengths), so sharing is safe. Under CUDAGraph the cached tensors
+    are persistent (held by the cache) with stable addresses across replays,
+    and each N is used only by its own captured graph — so this is capture-safe
+    while removing the per-call ``arange`` + ``ones`` (fill) launches that
+    otherwise fire on every layer × window × decode step.
+    """
+    qo_indptr = torch.arange(n + 1, dtype=torch.int32, device=device)
+    kv_last_page_lens = torch.ones(n, dtype=torch.int32, device=device)
+    return qo_indptr, kv_last_page_lens
+
+
 # FP8 KV cache (1xGROUP_SIZE block-scale quantization).
 #
 # Storage: unified_kv[total_pages, D] in e4m3fnuz + kv_scales[total_pages,
@@ -971,8 +994,10 @@ def _sparse_attn_v4_paged_decode_asm(
     kv_rope = unified_kv_rope.view(-1, page_size, nhead_kv, V4_DIM_ROPE)
 
     # ---- per-token paged layout (one slot per token, decode=1) ----------
-    qo_indptr = torch.arange(N + 1, dtype=torch.int32, device=device)
-    kv_last_page_lens = torch.ones(N, dtype=torch.int32, device=device)
+    # qo_indptr/kv_last_page_lens depend only on N (constant per CUDAGraph
+    # batch size) → build once per (N, device) and reuse, instead of firing a
+    # fresh arange + ones (fill) on every layer × window × decode step.
+    qo_indptr, kv_last_page_lens = _v4_decode_const_indices(N, device)
     kv_indptr_i32 = kv_indptr.to(torch.int32)
     kv_page_indices_i32 = kv_indices.to(torch.int32).contiguous()
     max_seqlen_q = 1

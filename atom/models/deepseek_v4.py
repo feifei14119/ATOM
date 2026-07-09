@@ -1085,11 +1085,7 @@ class Compressor(nn.Module):
             cache_scale=self.cache_scale if is_quant else None,
             use_ue8m0=(self.scale_fmt == "ue8m0"),
             preshuffle=True,
-            fp8_max=(
-                torch.finfo(self.kv_cache.dtype).max
-                if (is_quant or main_2buff_fp8) and self.kv_cache is not None
-                else None
-            ),
+            fp8_max=(torch.finfo(self.kv_cache.dtype).max if is_quant else None),
             main_2buff_fp8=main_2buff_fp8,
             kv_cache_rope=scatter_kv_cache_rope,
         )

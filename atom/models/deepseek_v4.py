@@ -96,6 +96,7 @@ from atom.model_ops.v4_kernels import (
     fused_compress_attn,
     inverse_rope_inplace,
     qk_norm_rope_maybe_quant,
+    qk_norm_rope_maybe_quant_fp8_2buff,
     qk_norm_rope_quant_2buff,
     scale_indexer_weights,
     sparse_attn_v4_paged_decode,
@@ -137,6 +138,11 @@ _V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 # Fused-kernel switches. Default off; flip via env to A/B against the eager path.
 _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
+# Replace the aiter fp8 2buff op1 (`fused_qk_norm_rope_group_quant`) with the
+# compile-safe Triton path (bf16 norm/rope kernel + Triton group-quant). Decode
+# emits a separate `swa_write_2buff_prepacked` since the Triton path does not
+# fuse the ring-scatter. Default off; A/B against op1 or run where op1 is absent.
+_V4_USE_TRITON_2BUFF = os.environ.get("V4_USE_TRITON_2BUFF", "0") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 
@@ -1900,7 +1906,42 @@ class DeepseekV4Attention(nn.Module):
         # launch, emitting the 2buff layout (nope-fp8 [.,512] + rope-bf16 [.,64])
         # that op4 (prefill) and op5 (decode) consume directly — no torch quant.
         q_packed = q_rope_q = k_packed = k_rope = None
-        if self.kv_fp8:
+        if self.kv_fp8 and _V4_USE_TRITON_2BUFF:
+            # Env-gated compile-safe Triton fp8 2buff, replacing aiter op1
+            # `fused_qk_norm_rope_group_quant`. Emits the identical 2buff layout
+            # (nope-fp8 [.,512] + rope-bf16 [.,64]) op4/op5 consume. Compute-only:
+            # unlike op1 it does NOT fuse the decode SWA ring-scatter, so decode
+            # emits a separate `swa_write_2buff_prepacked` below with addressing
+            # identical to op1's fused scatter (write_per_batch >= tokens-per-seq
+            # so the per-seq tail covers exactly the decode tokens). Prefill
+            # scatters its in-chunk tail post-attn regardless (see below), so its
+            # k_packed/k_rope flow to op4 unchanged and need no write here.
+            q_packed, q_rope_q, k_packed, k_rope = qk_norm_rope_maybe_quant_fp8_2buff(
+                q,
+                kv_pre,
+                self.kv_norm.weight,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                positions,
+                self.n_local_heads,
+                self.head_dim,
+                rd,
+                self.eps,
+            )
+            if is_decode:
+                swa_write_2buff_prepacked(
+                    k_packed.view(k_packed.shape[0], -1),
+                    k_rope.view(k_rope.shape[0], -1),
+                    positions,
+                    attn_md.cu_seqlens_q,
+                    state_slot_mapping,
+                    self.swa_kv,
+                    self.swa_kv_rope,
+                    cache_size,
+                    min(attn_md.max_seqlen_q, cache_size),
+                )
+            q_sa = kv = q_scale = kv_scale = None
+        elif self.kv_fp8:
             if is_decode:
                 # Decode: op1 fuses the SWA ring-scatter of K and returns the
                 # pre-packed fp8 Q for the asm decode kernel (op5). K buffers

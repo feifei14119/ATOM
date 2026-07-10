@@ -42,6 +42,7 @@ from atom.model_ops.v4_kernels.paged_prefill_indices import (
 from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
     qk_norm_rope_maybe_quant,
     qk_norm_rope_maybe_quant_reference,
+    qk_norm_rope_maybe_quant_fp8_2buff,
 )
 from atom.model_ops.v4_kernels.state_writes import (
     qk_norm_rope_quant_2buff,
@@ -73,4 +74,5 @@ __all__ = [
     "write_v4_paged_prefill_indices_reference",
     "qk_norm_rope_maybe_quant",
     "qk_norm_rope_maybe_quant_reference",
+    "qk_norm_rope_maybe_quant_fp8_2buff",
 ]

@@ -1238,7 +1238,7 @@ def sparse_attn_v4_paged_decode(
             )
         _log_mla_decode_compare(out_asm, out_tri, kv_indptr, out_ref=out_ref)
         return out_asm if use_asm else out_tri
-    if get_gfx() == "gfx1250":
+    if get_gfx() == "gfx1250" or os.environ.get("ATOM_USE_AITER_TRITON_ATTN", "0") == "1":
         return pa_decode_sparse(
             q,
             unified_kv,

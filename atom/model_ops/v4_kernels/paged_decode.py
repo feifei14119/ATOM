@@ -1045,17 +1045,35 @@ def sparse_attn_v4_paged_decode(
     unreachable from the model).
     """
     if unified_kv_rope is not None:
-        return _sparse_attn_v4_paged_decode_asm(
-            unified_kv,
+        # Native 2buff fp8 decode. Default routes to the aiter asm kernel (op5).
+        # Set ATOM_USE_ASM_MLA_DECODE=0 to instead dequantize the fp8 KV pool
+        # + prepacked fp8 Q back to bf16 and run the Triton decode kernel on the
+        # SAME inputs — an A/B debug path for the asm accuracy issue (not perf
+        # optimized: the dequant is eager torch).
+        if os.environ.get("ATOM_USE_ASM_MLA_DECODE", "1") == "1":
+            return _sparse_attn_v4_paged_decode_asm(
+                unified_kv,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
+                softmax_scale,
+                unified_kv_rope,
+                q_packed_in,
+                q_rope_in,
+                qo_indptr=qo_indptr,
+                kv_last_page_lens=kv_last_page_lens,
+            )
+        from atom.model_ops.v4_kernels.v4_quant import dequantize_v4_2buff_to_bf16
+
+        q_bf16 = dequantize_v4_2buff_to_bf16(q_packed_in, q_rope_in)
+        unified_kv_bf16 = dequantize_v4_2buff_to_bf16(unified_kv, unified_kv_rope)
+        return _sparse_attn_v4_paged_decode_triton(
+            q_bf16,
+            unified_kv_bf16,
             kv_indices,
             kv_indptr,
             attn_sink,
             softmax_scale,
-            unified_kv_rope,
-            q_packed_in,
-            q_rope_in,
-            qo_indptr=qo_indptr,
-            kv_last_page_lens=kv_last_page_lens,
         )
     if get_gfx() == "gfx1250":
         return pa_decode_sparse(

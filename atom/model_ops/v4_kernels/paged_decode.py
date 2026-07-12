@@ -70,26 +70,41 @@ _logger = logging.getLogger(__name__)
 # torch reference, so it must not run under CUDA-graph capture.
 _MLA_CMP_STATE: dict[str, float] = {
     "calls": 0.0,
-    "sum_mean_abs_tri": 0.0,  # asm vs triton
+    "valid_calls": 0.0,  # calls with >=1 valid token
+    "sum_mean_abs_tri": 0.0,  # asm vs triton (masked)
     "max_abs_tri": 0.0,
-    "max_rel_tri": 0.0,
     "worst_span_tri": -1.0,  # kv span at the worst-abs token
-    "max_abs_asm_ref": 0.0,  # asm vs reference (oracle)
-    "max_abs_tri_ref": 0.0,  # triton vs reference (oracle)
+    "worst_head_tri": -1.0,  # head at the worst-abs token
+    "asm_nonfinite": 0.0,  # non-finite output elems (valid tokens) from asm
+    "tri_nonfinite": 0.0,  # ... from triton (debug/dequant path)
+    "sum_max_abs_asm_ref": 0.0,  # asm vs reference (oracle), masked
+    "sum_max_abs_tri_ref": 0.0,  # triton vs reference (oracle), masked
 }
 
 
-def _mla_cmp_stats(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float, float, int]:
-    """(max_abs, mean_abs, max_rel, argmax_token) between two [T, H, D] tensors."""
-    af = a.detach().float()
-    bf = b.detach().float()
-    diff = (af - bf).abs()
-    max_abs = float(diff.max().item())
-    mean_abs = float(diff.mean().item())
-    max_rel = float((diff / bf.abs().clamp_min(1e-6)).max().item())
-    # token index of the worst per-element abs diff
-    flat = int(diff.reshape(diff.shape[0], -1).max(dim=-1).values.argmax().item())
-    return max_abs, mean_abs, max_rel, flat
+def _mla_valid_token_mask(
+    out: torch.Tensor, kv_indptr: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token validity (kv span > 0) + the span vector, for a [T, ...] output.
+
+    Padded decode-grid rows carry a 0-length KV span; the reference/triton paths
+    produce NaN there (softmax over nothing) while asm bails — so those rows must
+    be excluded from divergence stats.
+    """
+    T = out.shape[0]
+    indptr = kv_indptr.to(torch.int64)
+    if indptr.numel() >= T + 1:
+        span = (indptr[1 : T + 1] - indptr[:T]).clamp(min=0)
+    else:
+        span = torch.ones(T, dtype=torch.int64, device=out.device)
+    return span > 0, span
+
+
+def _mla_masked_abs(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> float:
+    """Max abs diff over a boolean element mask; 0.0 if nothing is selected."""
+    diff = (a - b).abs()
+    sel = diff[mask]
+    return float(sel.max().item()) if sel.numel() else 0.0
 
 
 def _log_mla_decode_compare(
@@ -101,36 +116,55 @@ def _log_mla_decode_compare(
     """Accumulate + periodically emit asm-vs-triton(-vs-reference) decode diffs.
 
     Gated by ``ATOM_MLA_DECODE_COMPARE=1`` from ``sparse_attn_v4_paged_decode``.
+    Stats are masked to valid tokens (kv span > 0) and finite elements so padded
+    decode rows do not pollute the numbers.
     """
     st = _MLA_CMP_STATE
     st["calls"] += 1.0
     calls = int(st["calls"])
 
-    max_abs, mean_abs, max_rel, worst_tok = _mla_cmp_stats(out_asm, out_tri)
-    st["sum_mean_abs_tri"] += mean_abs
-    if max_abs > st["max_abs_tri"]:
-        st["max_abs_tri"] = max_abs
-        # KV span (number of gathered kv slots) for the worst-diff token.
-        try:
-            indptr = kv_indptr.to(torch.int64)
-            if worst_tok + 1 < indptr.numel():
-                st["worst_span_tri"] = float(
-                    (indptr[worst_tok + 1] - indptr[worst_tok]).item()
-                )
-        except Exception:  # noqa: BLE001 - span is best-effort diagnostics only
-            pass
-    if max_rel > st["max_rel_tri"]:
-        st["max_rel_tri"] = max_rel
+    T = out_asm.shape[0]
+    a = out_asm.detach().float()
+    b = out_tri.detach().float()
+    valid_tok, span = _mla_valid_token_mask(out_asm, kv_indptr)
+    vt = valid_tok.reshape(T, *([1] * (a.dim() - 1)))
+
+    st["asm_nonfinite"] += float(((~torch.isfinite(a)) & vt).sum().item())
+    st["tri_nonfinite"] += float(((~torch.isfinite(b)) & vt).sum().item())
+
+    mask = torch.isfinite(a) & torch.isfinite(b) & vt
+    max_abs = mean_abs = 0.0
+    worst_span = worst_head = -1
+    if bool(mask.any().item()):
+        st["valid_calls"] += 1.0
+        diff = (a - b).abs()
+        sel = diff[mask]
+        max_abs = float(sel.max().item())
+        mean_abs = float(sel.mean().item())
+        st["sum_mean_abs_tri"] += mean_abs
+        per_tok = torch.where(mask, diff, torch.zeros_like(diff)).reshape(T, -1)
+        worst_tok = int(per_tok.max(dim=-1).values.argmax().item())
+        worst_span = int(span[worst_tok].item())
+        if a.dim() == 3:
+            per_head = torch.where(mask, diff, torch.zeros_like(diff)).amax(dim=(0, 2))
+            worst_head = int(per_head.argmax().item())
+        if max_abs > st["max_abs_tri"]:
+            st["max_abs_tri"] = max_abs
+            st["worst_span_tri"] = float(worst_span)
+            st["worst_head_tri"] = float(worst_head)
 
     ref_msg = ""
     if out_ref is not None:
-        asm_ref_abs, _, _, _ = _mla_cmp_stats(out_asm, out_ref)
-        tri_ref_abs, _, _, _ = _mla_cmp_stats(out_tri, out_ref)
-        st["max_abs_asm_ref"] = max(st["max_abs_asm_ref"], asm_ref_abs)
-        st["max_abs_tri_ref"] = max(st["max_abs_tri_ref"], tri_ref_abs)
+        r = out_ref.detach().float()
+        rmask = torch.isfinite(a) & torch.isfinite(r) & vt
+        asm_ref = _mla_masked_abs(a, r, rmask)
+        tri_ref = _mla_masked_abs(b, r, rmask)
+        st["sum_max_abs_asm_ref"] += asm_ref
+        st["sum_max_abs_tri_ref"] += tri_ref
+        vc = max(int(st["valid_calls"]), 1)
         ref_msg = (
-            f" | vs ref: asm={asm_ref_abs:.4e} tri={tri_ref_abs:.4e}"
-            f" (run max asm={st['max_abs_asm_ref']:.4e} tri={st['max_abs_tri_ref']:.4e})"
+            f" | vs ref (avg max_abs): asm={st['sum_max_abs_asm_ref'] / vc:.4e} "
+            f"tri={st['sum_max_abs_tri_ref'] / vc:.4e}"
         )
 
     verbose = os.environ.get("ATOM_MLA_DECODE_COMPARE_VERBOSE", "0") == "1"
@@ -138,17 +172,18 @@ def _log_mla_decode_compare(
     if verbose:
         _logger.info(
             "[mla-cmp] call=%d T=%d asm-vs-tri max_abs=%.4e mean_abs=%.4e "
-            "max_rel=%.4e worst_tok=%d span=%.0f%s",
-            calls, out_asm.shape[0], max_abs, mean_abs, max_rel,
-            worst_tok, st["worst_span_tri"], ref_msg,
+            "worst_head=%d worst_span=%d%s",
+            calls, T, max_abs, mean_abs, worst_head, worst_span, ref_msg,
         )
     elif every > 0 and calls % every == 0:
+        vc = max(int(st["valid_calls"]), 1)
         _logger.info(
-            "[mla-cmp] calls=%d asm-vs-tri run_max_abs=%.4e run_max_rel=%.4e "
-            "avg_mean_abs=%.4e worst_span=%.0f | vs ref run_max: asm=%.4e tri=%.4e",
-            calls, st["max_abs_tri"], st["max_rel_tri"],
-            st["sum_mean_abs_tri"] / max(calls, 1), st["worst_span_tri"],
-            st["max_abs_asm_ref"], st["max_abs_tri_ref"],
+            "[mla-cmp] calls=%d valid=%d asm-vs-tri run_max_abs=%.4e "
+            "avg_mean_abs=%.4e worst_head=%d worst_span=%d | nonfinite asm=%d tri=%d%s",
+            calls, int(st["valid_calls"]), st["max_abs_tri"],
+            st["sum_mean_abs_tri"] / vc, int(st["worst_head_tri"]),
+            int(st["worst_span_tri"]), int(st["asm_nonfinite"]),
+            int(st["tri_nonfinite"]), ref_msg,
         )
 
 

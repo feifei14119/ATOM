@@ -49,7 +49,6 @@ the captured launch sequence.
 from __future__ import annotations
 
 import functools
-import logging
 import os
 
 import torch
@@ -62,129 +61,6 @@ from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
-
-_logger = logging.getLogger(__name__)
-
-# Running aggregate for the ATOM_MLA_DECODE_COMPARE debug mode (strategy #1/#2).
-# Eager-only: the compare path issues .item()/host syncs and an optional pure
-# torch reference, so it must not run under CUDA-graph capture.
-_MLA_CMP_STATE: dict[str, float] = {
-    "calls": 0.0,
-    "valid_calls": 0.0,  # calls with >=1 valid token
-    "sum_mean_abs_tri": 0.0,  # asm vs triton (masked)
-    "max_abs_tri": 0.0,
-    "worst_span_tri": -1.0,  # kv span at the worst-abs token
-    "worst_head_tri": -1.0,  # head at the worst-abs token
-    "asm_nonfinite": 0.0,  # non-finite output elems (valid tokens) from asm
-    "tri_nonfinite": 0.0,  # ... from triton (debug/dequant path)
-    "sum_max_abs_asm_ref": 0.0,  # asm vs reference (oracle), masked
-    "sum_max_abs_tri_ref": 0.0,  # triton vs reference (oracle), masked
-}
-
-
-def _mla_valid_token_mask(
-    out: torch.Tensor, kv_indptr: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-token validity (kv span > 0) + the span vector, for a [T, ...] output.
-
-    Padded decode-grid rows carry a 0-length KV span; the reference/triton paths
-    produce NaN there (softmax over nothing) while asm bails — so those rows must
-    be excluded from divergence stats.
-    """
-    T = out.shape[0]
-    indptr = kv_indptr.to(torch.int64)
-    if indptr.numel() >= T + 1:
-        span = (indptr[1 : T + 1] - indptr[:T]).clamp(min=0)
-    else:
-        span = torch.ones(T, dtype=torch.int64, device=out.device)
-    return span > 0, span
-
-
-def _mla_masked_abs(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> float:
-    """Max abs diff over a boolean element mask; 0.0 if nothing is selected."""
-    diff = (a - b).abs()
-    sel = diff[mask]
-    return float(sel.max().item()) if sel.numel() else 0.0
-
-
-def _log_mla_decode_compare(
-    out_asm: torch.Tensor,
-    out_tri: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    out_ref: torch.Tensor | None = None,
-) -> None:
-    """Accumulate + periodically emit asm-vs-triton(-vs-reference) decode diffs.
-
-    Gated by ``ATOM_MLA_DECODE_COMPARE=1`` from ``sparse_attn_v4_paged_decode``.
-    Stats are masked to valid tokens (kv span > 0) and finite elements so padded
-    decode rows do not pollute the numbers.
-    """
-    st = _MLA_CMP_STATE
-    st["calls"] += 1.0
-    calls = int(st["calls"])
-
-    T = out_asm.shape[0]
-    a = out_asm.detach().float()
-    b = out_tri.detach().float()
-    valid_tok, span = _mla_valid_token_mask(out_asm, kv_indptr)
-    vt = valid_tok.reshape(T, *([1] * (a.dim() - 1)))
-
-    st["asm_nonfinite"] += float(((~torch.isfinite(a)) & vt).sum().item())
-    st["tri_nonfinite"] += float(((~torch.isfinite(b)) & vt).sum().item())
-
-    mask = torch.isfinite(a) & torch.isfinite(b) & vt
-    max_abs = mean_abs = 0.0
-    worst_span = worst_head = -1
-    if bool(mask.any().item()):
-        st["valid_calls"] += 1.0
-        diff = (a - b).abs()
-        sel = diff[mask]
-        max_abs = float(sel.max().item())
-        mean_abs = float(sel.mean().item())
-        st["sum_mean_abs_tri"] += mean_abs
-        per_tok = torch.where(mask, diff, torch.zeros_like(diff)).reshape(T, -1)
-        worst_tok = int(per_tok.max(dim=-1).values.argmax().item())
-        worst_span = int(span[worst_tok].item())
-        if a.dim() == 3:
-            per_head = torch.where(mask, diff, torch.zeros_like(diff)).amax(dim=(0, 2))
-            worst_head = int(per_head.argmax().item())
-        if max_abs > st["max_abs_tri"]:
-            st["max_abs_tri"] = max_abs
-            st["worst_span_tri"] = float(worst_span)
-            st["worst_head_tri"] = float(worst_head)
-
-    ref_msg = ""
-    if out_ref is not None:
-        r = out_ref.detach().float()
-        rmask = torch.isfinite(a) & torch.isfinite(r) & vt
-        asm_ref = _mla_masked_abs(a, r, rmask)
-        tri_ref = _mla_masked_abs(b, r, rmask)
-        st["sum_max_abs_asm_ref"] += asm_ref
-        st["sum_max_abs_tri_ref"] += tri_ref
-        vc = max(int(st["valid_calls"]), 1)
-        ref_msg = (
-            f" | vs ref (avg max_abs): asm={st['sum_max_abs_asm_ref'] / vc:.4e} "
-            f"tri={st['sum_max_abs_tri_ref'] / vc:.4e}"
-        )
-
-    verbose = os.environ.get("ATOM_MLA_DECODE_COMPARE_VERBOSE", "0") == "1"
-    every = int(os.environ.get("ATOM_MLA_DECODE_COMPARE_EVERY", "100") or "100")
-    if verbose:
-        _logger.info(
-            "[mla-cmp] call=%d T=%d asm-vs-tri max_abs=%.4e mean_abs=%.4e "
-            "worst_head=%d worst_span=%d%s",
-            calls, T, max_abs, mean_abs, worst_head, worst_span, ref_msg,
-        )
-    elif every > 0 and calls % every == 0:
-        vc = max(int(st["valid_calls"]), 1)
-        _logger.info(
-            "[mla-cmp] calls=%d valid=%d asm-vs-tri run_max_abs=%.4e "
-            "avg_mean_abs=%.4e worst_head=%d worst_span=%d | nonfinite asm=%d tri=%d%s",
-            calls, int(st["valid_calls"]), st["max_abs_tri"],
-            st["sum_mean_abs_tri"] / vc, int(st["worst_head_tri"]),
-            int(st["worst_span_tri"]), int(st["asm_nonfinite"]),
-            int(st["tri_nonfinite"]), ref_msg,
-        )
 
 
 # FP8 KV cache (1xGROUP_SIZE block-scale quantization).
@@ -1116,11 +992,11 @@ def _sparse_attn_v4_paged_decode_asm(
     output = torch.empty(
         (N, H, V4_DIM_NOPE + V4_DIM_ROPE), dtype=torch.bfloat16, device=device
     )
-    # Debug (strategy #4.1): force a single KV split + direct bf16 write so the
-    # stage2 cross-split LSE merge is bypassed entirely — isolates whether the
-    # asm accuracy gap lives in stage1 (single-pass attention) or stage2 (merge).
-    # ATOM_MLA_DECODE_ASM_FORCE_NOSPLIT=0 restores the auto split heuristic.
-    if os.environ.get("ATOM_MLA_DECODE_ASM_FORCE_NOSPLIT", "1") == "1":
+    # Debug (strategy #4.1): ATOM_MLA_DECODE_ASM_FORCE_NOSPLIT=1 forces a single
+    # KV split + direct bf16 write so the stage2 cross-split LSE merge is bypassed
+    # entirely — isolates whether the asm accuracy gap lives in stage1 (single-pass
+    # attention) or stage2 (merge). Default (unset/0) uses the auto split heuristic.
+    if os.environ.get("ATOM_MLA_DECODE_ASM_FORCE_NOSPLIT", "0") == "1":
         num_kv_splits = 1
     out_16_nosplit = 1 if num_kv_splits == 1 else 0
 
@@ -1175,69 +1051,19 @@ def sparse_attn_v4_paged_decode(
     unreachable from the model).
     """
     if unified_kv_rope is not None:
-        # Native 2buff fp8 decode. Default routes to the aiter asm kernel (op5).
-        # Set ATOM_USE_ASM_MLA_DECODE=0 to instead dequantize the fp8 KV pool
-        # + prepacked fp8 Q back to bf16 and run the Triton decode kernel on the
-        # SAME inputs — an A/B debug path for the asm accuracy issue (not perf
-        # optimized: the dequant is eager torch).
-        #
-        # ATOM_MLA_DECODE_COMPARE=1 (eager only): run asm AND triton on identical
-        # inputs every call and log the divergence (strategy #1). Add
-        # ATOM_MLA_DECODE_COMPARE_REF=1 to also compute the pure-torch reference
-        # oracle (strategy #2). ATOM_USE_ASM_MLA_DECODE then only selects which
-        # result is returned to the model.
-        use_asm = os.environ.get("ATOM_USE_ASM_MLA_DECODE", "1") == "1"
-        compare = os.environ.get("ATOM_MLA_DECODE_COMPARE", "0") == "1"
-
-        def _run_asm() -> torch.Tensor:
-            return _sparse_attn_v4_paged_decode_asm(
-                unified_kv,
-                kv_indices,
-                kv_indptr,
-                attn_sink,
-                softmax_scale,
-                unified_kv_rope,
-                q_packed_in,
-                q_rope_in,
-                qo_indptr=qo_indptr,
-                kv_last_page_lens=kv_last_page_lens,
-            )
-
-        def _run_triton() -> torch.Tensor:
-            from atom.model_ops.v4_kernels.v4_quant import dequantize_v4_2buff_to_bf16
-
-            q_bf16 = dequantize_v4_2buff_to_bf16(q_packed_in, q_rope_in)
-            unified_kv_bf16 = dequantize_v4_2buff_to_bf16(unified_kv, unified_kv_rope)
-            return _sparse_attn_v4_paged_decode_triton(
-                q_bf16,
-                unified_kv_bf16,
-                kv_indices,
-                kv_indptr,
-                attn_sink,
-                softmax_scale,
-            )
-
-        if not compare:
-            return _run_asm() if use_asm else _run_triton()
-
-        out_asm = _run_asm()
-        out_tri = _run_triton()
-        out_ref = None
-        if os.environ.get("ATOM_MLA_DECODE_COMPARE_REF", "0") == "1":
-            from atom.model_ops.v4_kernels.v4_quant import dequantize_v4_2buff_to_bf16
-
-            q_bf16 = dequantize_v4_2buff_to_bf16(q_packed_in, q_rope_in)
-            unified_kv_bf16 = dequantize_v4_2buff_to_bf16(unified_kv, unified_kv_rope)
-            out_ref = sparse_attn_v4_paged_decode_reference(
-                q_bf16,
-                unified_kv_bf16,
-                kv_indices,
-                kv_indptr,
-                attn_sink,
-                softmax_scale,
-            )
-        _log_mla_decode_compare(out_asm, out_tri, kv_indptr, out_ref=out_ref)
-        return out_asm if use_asm else out_tri
+        # Native 2buff fp8 decode: aiter asm kernel (op5) with pre-packed fp8 Q.
+        return _sparse_attn_v4_paged_decode_asm(
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            unified_kv_rope,
+            q_packed_in,
+            q_rope_in,
+            qo_indptr=qo_indptr,
+            kv_last_page_lens=kv_last_page_lens,
+        )
     if get_gfx() == "gfx1250" or os.environ.get("ATOM_USE_AITER_TRITON_ATTN", "0") == "1":
         return pa_decode_sparse(
             q,

@@ -153,6 +153,7 @@
 <li class="toctree-l2"><a class="reference internal" href="model_support_guide.html#weight-loading">3. Weight Loading</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#function-signature">Function Signature</a></li>
 <li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#loading-flow">Loading Flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#batched-expert-staging">Batched Expert Staging</a></li>
 <li class="toctree-l3"><a class="reference internal" href="model_support_guide.html#layers-beyond-num-hidden-layers">Layers Beyond <code class="docutils literal notranslate"><span class="pre">num_hidden_layers</span></code></a></li>
 </ul>
 </li>
@@ -319,6 +320,7 @@
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#device-assignment">Device Assignment</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dpmetadata">DPMetadata</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#coremanager-dp-orchestration">CoreManager (DP Orchestration)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#dp-request-load-balancing">DP Request Load Balancing</a></li>
 <li class="toctree-l3"><a class="reference internal" href="distributed_guide.html#id1">Configuration</a></li>
 </ul>
 </li>
@@ -466,7 +468,7 @@
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Framework Integrations</span></p>
 <ul>
-<li class="toctree-l1"><a class="reference internal" href="vllm_plugin_backend_guide.html">ATOM vLLM Plugin Backend</a><ul>
+<li class="toctree-l1"><a class="reference internal" href="vllm_plugin_backend_guide.html">vLLM-ATOM Backend</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="vllm_plugin_backend_guide.html#architecture">1. Architecture</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#design-overview">1.1 Design overview</a></li>
 <li class="toctree-l3"><a class="reference internal" href="vllm_plugin_backend_guide.html#how-it-works">1.2 How it works</a></li>
@@ -600,11 +602,11 @@ docker<span class="w"> </span>run<span class="w"> </span>-it<span class="w"> </s
 <td><p>1</p></td>
 <td><p><span class="xref myst">recipes/GPT-OSS.md</span></p></td>
 </tr>
-<tr class="row-odd"><td><p>Kimi-K2.5</p></td>
+<tr class="row-odd"><td><p>Kimi-K2.5/K2.7</p></td>
 <td><p>MoE</p></td>
 <td><p>MXFP4</p></td>
 <td><p>4</p></td>
-<td><p><span class="xref myst">recipes/Kimi-K2.5.md</span></p></td>
+<td><p><span class="xref myst">recipes/Kimi-K2.md</span></p></td>
 </tr>
 <tr class="row-even"><td><p>Kimi-K2-Thinking</p></td>
 <td><p>MoE</p></td>

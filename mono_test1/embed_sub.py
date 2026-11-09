@@ -69,7 +69,7 @@ args.output.with_suffix('.bin').write_bytes(body[:-4])
 report = {'target': 'gfx1100', 'supplier_function_bytes': size,
           'embedded_bytes': size-4, 'removed': 'final s_setpc_b64 s[30:31]',
           'payload_sha256': hashlib.sha256(body[:-4]).hexdigest(),
-          'net_clobbers': ['s0-s3', 'v8-v15', 'vcc', 'scc', 'memory'],
+          'payload_clobbers': ['s0-s3', 'v8-v15', 'vcc', 'scc', 'memory'],
           'exec_restored_by_supplier': True, 'relative_branches_preserved': True}
 args.output.with_suffix('.json').write_text(json.dumps(report, indent=2)+'\n')
 print('Generated inline .long payload: 288 bytes; original body unchanged except final return')

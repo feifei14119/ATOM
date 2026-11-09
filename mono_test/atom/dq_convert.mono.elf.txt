@@ -1,0 +1,149 @@
+ELF Header:
+  Magic:   7f 45 4c 46 02 01 01 40 04 00 00 00 00 00 00 00
+  Class:                             ELF64
+  Data:                              2's complement, little endian
+  Version:                           1 (current)
+  OS/ABI:                            AMDGPU - HSA
+  ABI Version:                       4
+  Type:                              DYN (Shared object file)
+  Machine:                           EM_AMDGPU
+  Version:                           0x1
+  Entry point address:               0x0
+  Start of program headers:          64 (bytes into file)
+  Start of section headers:          4640 (bytes into file)
+  Flags:                             0x549, gfx1250, xnack, sramecc
+  Size of this header:               64 (bytes)
+  Size of program headers:           56 (bytes)
+  Number of program headers:         8
+  Size of section headers:           64 (bytes)
+  Number of section headers:         14
+  Section header string table index: 12
+There are 14 section headers, starting at offset 0x1220:
+
+Section Headers:
+  [Nr] Name              Type            Address          Off    Size   ES Flg Lk Inf Al
+  [ 0]                   NULL            0000000000000000 000000 000000 00      0   0  0
+  [ 1] .note             NOTE            0000000000000200 000200 0004d0 00   A  0   0  4
+  [ 2] .dynsym           DYNSYM          00000000000006d0 0006d0 0000a8 18   A  5   1  8
+  [ 3] .gnu.hash         GNU_HASH        0000000000000778 000778 00003c 00   A  2   0  8
+  [ 4] .hash             HASH            00000000000007b4 0007b4 000040 04   A  2   0  4
+  [ 5] .dynstr           STRTAB          00000000000007f4 0007f4 000096 00   A  0   0  1
+  [ 6] .rodata           PROGBITS        00000000000008c0 0008c0 000040 00   A  0   0 64
+  [ 7] .text             PROGBITS        0000000000001900 000900 000630 00  AX  0   0 256
+  [ 8] .dynamic          DYNAMIC         0000000000002f30 000f30 000070 10  WA  5   0  8
+  [ 9] .relro_padding    NOBITS          0000000000002fa0 000fa0 000060 00  WA  0   0  1
+  [10] .comment          PROGBITS        0000000000000000 000fa0 0000af 01  MS  0   0  1
+  [11] .symtab           SYMTAB          0000000000000000 001050 0000c0 18     13   2  8
+  [12] .shstrtab         STRTAB          0000000000000000 001110 000070 00      0   0  1
+  [13] .strtab           STRTAB          0000000000000000 001180 00009f 00      0   0  1
+Key to Flags:
+  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),
+  L (link order), O (extra OS processing required), G (group), T (TLS),
+  C (compressed), x (unknown), o (OS specific), E (exclude),
+  R (retain), p (processor specific)
+
+There are no relocations in this file.
+
+Symbol table '.dynsym' contains 7 entries:
+   Num:    Value          Size Type    Bind   Vis       Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   UND 
+     1: 0000000000001900  1584 FUNC    GLOBAL PROTECTED   7 mono_dq_convert_kernel
+     2: 0000000000001904  1576 FUNC    GLOBAL PROTECTED   7 mono_dq_convert_stage
+     3: 0000000000001920     0 NOTYPE  GLOBAL DEFAULT     7 mono_dq_convert_payload
+     4: 0000000000001f14     0 NOTYPE  GLOBAL DEFAULT     7 mono_dq_convert_payload_end
+     5: 0000000000001f2c     0 NOTYPE  GLOBAL PROTECTED   7 mono_dq_convert_stage_end
+     6: 00000000000008c0    64 OBJECT  GLOBAL PROTECTED   6 mono_dq_convert_kernel.kd
+
+Symbol table '.symtab' contains 8 entries:
+   Num:    Value          Size Type    Bind   Vis       Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   UND 
+     1: 0000000000002f30     0 NOTYPE  LOCAL  HIDDEN      8 _DYNAMIC
+     2: 0000000000001900  1584 FUNC    GLOBAL PROTECTED   7 mono_dq_convert_kernel
+     3: 0000000000001904  1576 FUNC    GLOBAL PROTECTED   7 mono_dq_convert_stage
+     4: 0000000000001920     0 NOTYPE  GLOBAL DEFAULT     7 mono_dq_convert_payload
+     5: 0000000000001f14     0 NOTYPE  GLOBAL DEFAULT     7 mono_dq_convert_payload_end
+     6: 0000000000001f2c     0 NOTYPE  GLOBAL PROTECTED   7 mono_dq_convert_stage_end
+     7: 00000000000008c0    64 OBJECT  GLOBAL PROTECTED   6 mono_dq_convert_kernel.kd
+Displaying notes found in: .note
+  Owner                Data size 	Description
+  AMDGPU               0x000004b9	NT_AMDGPU_METADATA (AMDGPU Metadata)
+    AMDGPU Metadata:
+        ---
+amdhsa.kernels:
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_write
+        .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         32
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         48
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         64
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         80
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         96
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         112
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         128
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         144
+        .size:           4
+        .value_kind:     by_value
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         160
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         176
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         192
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         208
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         224
+        .size:           4
+        .value_kind:     by_value
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 240
+    .max_flat_workgroup_size: 256
+    .name:           mono_dq_convert_kernel
+    .private_segment_fixed_size: 0
+    .reqd_workgroup_size:
+      - 256
+      - 1
+      - 1
+    .sgpr_count:     48
+    .symbol:         mono_dq_convert_kernel.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     46
+    .wavefront_size: 32
+    .workgroup_processor_mode: 1
+amdhsa.target:   amdgcn-amd-amdhsa--gfx1250
+amdhsa.version:
+  - 1
+  - 2
+...
+

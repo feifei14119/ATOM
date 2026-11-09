@@ -1,0 +1,46 @@
+{
+  "target": "gfx1250",
+  "gpu_executed": false,
+  "supplier_sha256": "1784adcc12b4c43a0ce49b12033abff49ab01e84d0c96b2c98b8cd79ec1d00b2",
+  "roundtrip_text_bytes_identical": 2048,
+  "payload_bytes": 1524,
+  "approved_patch_bytes": 20,
+  "unchanged_payload_bytes": 1504,
+  "fragment_symbol": "mono_dq_convert_stage",
+  "fragment_bytes": 1576,
+  "fragment_sha256": "c4e072981ad731e578d1ec2286e8c9b67d64f319066acf7cea813b2adfe50362",
+  "branch_destinations": [
+    {
+      "offset": 12,
+      "target_offset": 1556
+    },
+    {
+      "offset": 1552,
+      "target_offset": 1556
+    },
+    {
+      "offset": 1572,
+      "target_offset": 1576
+    }
+  ],
+  "fragment_has_endpgm": false,
+  "fragment_has_pc_call_return": false,
+  "standalone_kernel_symbol": "mono_dq_convert_kernel",
+  "descriptor_checks": {
+    "roundtrip": {
+      "resource_bytes_match_original": true,
+      "entry_offset": 4352,
+      "rsrc1": "0xc00c0002",
+      "rsrc2": "0x1384"
+    },
+    "mono": {
+      "resource_bytes_match_original": true,
+      "entry_offset": 4160,
+      "rsrc1": "0xc00c0002",
+      "rsrc2": "0x1384"
+    }
+  },
+  "layout_addresses_verified": 4096,
+  "static_embedding_copies_verified": 2,
+  "mono_code_object_sha256": "45172861cac568afe237189efc74f53ece2e825c01e3660032c234dd1dd4eba2"
+}

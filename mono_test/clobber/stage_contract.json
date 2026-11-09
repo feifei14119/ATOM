@@ -1,0 +1,14 @@
+{
+  "symbol": "clobber_stage",
+  "target": "gfx1100",
+  "wave_size": 32,
+  "block_size": 128,
+  "kernarg_bytes": 16,
+  "lds_bytes": 512,
+  "private_bytes": 0,
+  "entry": "s[0:1]=kernarg pointer; s2=blockIdx.x; v0=logical threadIdx.x",
+  "effect": "second pointer[i] = first pointer[i] - 1; i = blockIdx.x*128 + threadIdx.x",
+  "clobbers": ["v0-v255", "s0-s105", "EXEC_LO", "VCC_LO", "SCC", "LDS[0:512]"],
+  "boundary": "all 128 threads enter; all waves reach the single final s_endpgm; memory is drained",
+  "relocatable_body": true
+}

@@ -337,14 +337,7 @@ CSR_AMDGPU_VGPRs:
 
 原文“总会分配 scratch 用作调用栈”的表述，不能推导为“每个调用都一定需要把活跃值写入 scratch”，也不能推导为“每个含调用的 kernel，其 `.private_segment_fixed_size` 都大于 0”。
 
-本目录的实测结果是：
-
-| 示例 | 现象 |
-| --- | --- |
-| 当前主 `mono_kernel` | 在主调用方中将 lane_bias 保留在 v41，返回后参与 mailbox 后处理；固定 private segment 为 0，VGPR/SGPR spill count 均为 0 |
-| 早期独立 `live_state_kernel`（历史实验） | 把调用方 VGPR 上限限制为 40；LLVM 自动生成 scratch store/load，固定 private segment 为 16 字节；源码现已归档，不参与当前构建 |
-
-两者 `.uses_dynamic_stack` 均为 true。这些结果描述的是生成代码和 metadata，不能据此断言运行时没有分配任何 scratch 后备内存。
+本目录当前使用普通设备函数 ABI，不设置寄存器上限，也不修改调用点掩码。当前最小 Mono 的固定 private segment 为 0，VGPR/SGPR spill count 均为 0；这只是本例编译结果，构建允许 scratch。`.uses_dynamic_stack` 为 true，不能据此断言运行时没有分配 scratch 后备内存。
 
 调用方编译器可以把活跃值放到 callee-saved 寄存器、进行 spill/reload，或者在允许的情况下重新计算。保存方式取决于当前实现、活跃值和资源压力。自动处理调用边界不等于保存全部物理寄存器的完整快照。
 
@@ -362,7 +355,7 @@ s_swappc_b64 s[30:31], s[16:17]
 scratch_load_b32 v1, off, off offset:4
 ```
 
-当前验证已直接集成到 `mono_kernel.cpp`：移除函数级 VGPR 上限，通过目标调用的自定义 regmask 仅保持 v40–v47；lane_bias 在 v41 中跨调用保留，不再生成上述 scratch 保存。机制及 ATOM 接入范围见 [ATOM_CALLSITE_REGMASK.md](ATOM_CALLSITE_REGMASK.md)。当前输出见 [build/mono_kernel.function.s](build/mono_kernel.function.s)，它是从编译器输出中摘出的主 Mono 函数体。第 2 节原文译文保持不变。
+以上指令来自早期实验，仅用于说明 scratch 的实际指令形式。当前目录已清理独立 probe 和自定义 regmask 流程，改为最简单的普通设备函数调用。执行 `make inspect` 后，可阅读 `build/mono_kernel.s` 和 `build/mono_kernel.disasm.txt`。第 2 节原文译文保持不变。
 
 隐式参数也应结合当前后端和具体调用方检查。例如，我们指定的 `stage_sub_device` 实际要求 `v31` 提供工作项标识、`s8:s9` 提供隐式参数指针。不能仅按原文参数列表顺序手算最终物理寄存器编号。
 
@@ -370,7 +363,7 @@ scratch_load_b32 v1, off, off offset:4
 
 第 2 节保留了原文对结构体传参的全部说明，包括其间不一致的描述和 TODO。特别是原文前面的 `byref` 说明、后面的 by-value struct 说明，以及 `sret` 参数位置说明，不应直接当作所有源语言和编译器版本都通用的确定规则。
 
-实际接入时，应使用当前编译器生成所需函数声明的调用代码，核对 LLVM IR、参数 lowering 结果和最终物理寄存器/栈布局。我们的 `Mailbox` 是 16 字节结构体；具体传参位置已经在本目录 [README.md](README.md) 中记录。
+实际接入时，应使用当前编译器生成所需函数声明的调用代码，核对 LLVM IR、参数 lowering 结果和最终物理寄存器/栈布局。我们的 `Mailbox` 是 16 字节结构体；具体传参位置见 [stages/sub_kernel.s](stages/sub_kernel.s) 的开头注释。
 
 ### 3.5 编译器通过什么机制知道要保存哪些寄存器
 
@@ -399,6 +392,5 @@ scratch_load_b32 v1, off, off offset:4
 - [README.md](README.md)：构建流程、ABI 保存责任、当前机器上的验证结果。
 - [stages/sub_api.h](stages/sub_api.h)：只有设备函数声明的调用接口。
 - [stages/sub_kernel.s](stages/sub_kernel.s)：已符合当前示例设备函数 ABI 的独立 ASM。
-- [mono_kernel.cpp](mono_kernel.cpp)：主 Mono 中的非末尾 ASM 调用与跨调用活跃值保留。
-- [history/README.md](history/README.md)：早期独立验证的归档说明。
+- [mono_kernel.cpp](mono_kernel.cpp)：主 Mono 中的普通设备函数调用。
 - [AMDGPU_DEVICE_FUNCTION_ABI.en.rst](AMDGPU_DEVICE_FUNCTION_ABI.en.rst)：逐段核对用英文原文快照。

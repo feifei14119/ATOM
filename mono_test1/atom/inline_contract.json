@@ -1,0 +1,178 @@
+{
+  "target": "gfx1250",
+  "wave_size": 32,
+  "block_threads": [
+    128,
+    256
+  ],
+  "symbol": "mono_dq_convert_inline_fragment",
+  "elf_type": "ET_REL; extraction artifact, not launchable/callable",
+  "source_sha256": "4050f8e1eacf2463c98adeb8f2aeee2ca93e2792de3a43e58088cbd36a05a711",
+  "fragment_bytes": 1604,
+  "fragment_sha256": "a2ca4aa077ab10e0a7522356270dc4b30d3f145e63ec61a02ac933e4b22c8e8a",
+  "fixed_inputs": {
+    "s[0:1]": "uniform GPU global args pointer",
+    "v0": "lane 0..31",
+    "s24": "wave in physical CTA"
+  },
+  "clobbers": [
+    "s2",
+    "s3",
+    "s4",
+    "s5",
+    "s6",
+    "s7",
+    "s8",
+    "s9",
+    "s10",
+    "s11",
+    "s12",
+    "s13",
+    "s14",
+    "s15",
+    "s16",
+    "s17",
+    "s18",
+    "s19",
+    "s20",
+    "s21",
+    "s22",
+    "s23",
+    "s25",
+    "s26",
+    "s27",
+    "s28",
+    "s29",
+    "s40",
+    "s41",
+    "s42",
+    "s43",
+    "s44",
+    "s45",
+    "s46",
+    "s47",
+    "s48",
+    "v4",
+    "v5",
+    "v6",
+    "v7",
+    "v8",
+    "v9",
+    "v10",
+    "v11",
+    "v12",
+    "v13",
+    "v14",
+    "v15",
+    "v16",
+    "v17",
+    "v18",
+    "v19",
+    "v20",
+    "v21",
+    "v22",
+    "v23",
+    "v24",
+    "v25",
+    "v26",
+    "v27",
+    "v28",
+    "v29",
+    "v30",
+    "v31",
+    "v32",
+    "v33",
+    "v34",
+    "v35",
+    "v36",
+    "v37",
+    "v38",
+    "v39",
+    "v40",
+    "v41",
+    "v42",
+    "v43",
+    "v44",
+    "v45",
+    "scc",
+    "memory"
+  ],
+  "sgpr_rename": {
+    "s30": "s40",
+    "s31": "s41",
+    "s32": "s42",
+    "s33": "s43",
+    "s34": "s44",
+    "s35": "s45",
+    "s36": "s46",
+    "s37": "s47",
+    "s38": "s48"
+  },
+  "patches": [
+    {
+      "offset": 4,
+      "original": "s_and_b32 s1, s1, 0xffff",
+      "replacement": [
+        "s_nop 0",
+        "s_nop 0"
+      ]
+    },
+    {
+      "offset": 96,
+      "original": "v_and_b32_e32 v0, 31, v0",
+      "replacement": [
+        "s_nop 0"
+      ]
+    },
+    {
+      "offset": 100,
+      "original": "s_mov_b32 s2, ttmp9",
+      "replacement": [
+        "s_mov_b32 s2, 0"
+      ]
+    },
+    {
+      "offset": 104,
+      "original": "s_and_b32 s3, ttmp7, 0xffff",
+      "replacement": [
+        "s_mov_b32 s3, 0",
+        "s_nop 0"
+      ]
+    },
+    {
+      "offset": 112,
+      "original": "s_bfe_u32 s4, ttmp7, 0x100010",
+      "replacement": [
+        "s_mov_b32 s4, 0",
+        "s_nop 0"
+      ]
+    },
+    {
+      "offset": 120,
+      "original": "s_bfe_u32 s24, ttmp8, 0x50019",
+      "replacement": [
+        "s_nop 0",
+        "s_nop 0"
+      ]
+    }
+  ],
+  "removed_exit": "s_endpgm",
+  "minimum_vgprs": 46,
+  "minimum_numbered_sgprs": 49,
+  "whole_function_register_caps": false,
+  "exec_entry_exit": "full wave32",
+  "mode_low8_inside": 192,
+  "mode_low8_restored": true,
+  "lds_bytes": 0,
+  "private_bytes_in_fragment": 0,
+  "virtual_grid": [
+    0,
+    0,
+    0
+  ],
+  "tile": [
+    64,
+    64
+  ],
+  "gpu_validation": "not run: no gfx1250 GPU locally"
+}

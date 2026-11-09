@@ -1,0 +1,92 @@
+{
+  "status": "assembled_and_statically_checked_only; gfx1250 execution pending",
+  "supplier_sha256": "1784adcc12b4c43a0ce49b12033abff49ab01e84d0c96b2c98b8cd79ec1d00b2",
+  "supplier_body_sha256": "d758be8e2e0f5e12990f854466bcc0cb33fe1a3643036b2260b468893da016be",
+  "target": "gfx1250",
+  "wave_size": 32,
+  "caller_block_size": 256,
+  "computing_physical_waves": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "kernel_symbol": "mono_dq_convert_kernel",
+  "fragment_symbol": "mono_dq_convert_stage",
+  "fragment_end_symbol": "mono_dq_convert_stage_end",
+  "payload_symbol": "mono_dq_convert_payload",
+  "payload_end_symbol": "mono_dq_convert_payload_end",
+  "entry": {
+    "s[0:1]": "240-byte stage parameter block; ordinary global or kernarg memory",
+    "EXEC_LO": "0xffffffff",
+    "TTMP8[29:25]": "original physical waveIDinGroup, 0..7",
+    "prior_work": "caller drains prior memory/async/ALU dependencies before entry"
+  },
+  "virtual_grid": [
+    0,
+    0,
+    0
+  ],
+  "shape": {
+    "rows": 64,
+    "columns": 64,
+    "input_bytes": 16384,
+    "output_bytes": 8192
+  },
+  "input_layout": "input[64*(16*(r//16)+8*((c//16)%2)+r%8) + 32*(c//32)+16*((r//8)%2)+c%16] = logical[r*64+c]",
+  "resources": {
+    "vgpr_count": 46,
+    "sgpr_count": 48,
+    "lds_bytes": 0,
+    "private_bytes": 0,
+    "float_denorm_mode_32": 0,
+    "float_denorm_mode_16_64": 3
+  },
+  "conservative_fragment_clobbers": [
+    "v0-v45",
+    "s0-s47",
+    "EXEC_LO",
+    "SCC",
+    "memory"
+  ],
+  "unchanged_special_state": [
+    "TTMP",
+    "MODE",
+    "M0",
+    "VCC"
+  ],
+  "exit": "branch to byte immediately after fragment; full EXEC; stage loads/stores drained",
+  "caller_obligations": [
+    "Declare compiler-visible net clobbers before register allocation; the .co cannot do so.",
+    "Save/restore R_keep outside the fragment; this object does not protect caller GPRs.",
+    "Provide a distinct input/output tile per real CTA; standalone wrapper launch grid is [1,1,1].",
+    "Pack input and initialize the 240-byte parameter block as documented.",
+    "Use a full-CTA join and suitable cache scope before consuming other waves' output.",
+    "Reconcile final caller descriptor, FP modes, scratch/spills and persistent-grid occupancy."
+  ],
+  "patches": [
+    {
+      "offset": 100,
+      "old_words": [
+        "BE820075"
+      ],
+      "replacement_assembly": "s_mov_b32 s2, 0"
+    },
+    {
+      "offset": 104,
+      "old_words": [
+        "8B03FF73",
+        "0000FFFF"
+      ],
+      "replacement_assembly": "s_mov_b32 s3, 0\ns_nop 0"
+    },
+    {
+      "offset": 112,
+      "old_words": [
+        "9304FF73",
+        "00100010"
+      ],
+      "replacement_assembly": "s_mov_b32 s4, 0\ns_nop 0"
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+; LLVM chooses the registers for all SSA values. Only the supplier inputs
+; have fixed physical locations. build.py supplies the net clobber contract.
+target triple = "amdgcn-amd-amdhsa"
+declare ptr addrspace(4) @llvm.amdgcn.kernarg.segment.ptr()
+declare i32 @llvm.amdgcn.workgroup.id.x()
+declare i32 @llvm.amdgcn.workitem.id.x()
+define amdgpu_kernel void @mono_boundary(ptr addrspace(1) %x, ptr addrspace(1) %tmp1, ptr addrspace(1) %tmp2, ptr addrspace(1) %out, i32 %seed) #0 {
+entry:
+ %ka = call ptr addrspace(4) @llvm.amdgcn.kernarg.segment.ptr()
+ %bid = call i32 @llvm.amdgcn.workgroup.id.x()
+ %tid = call i32 @llvm.amdgcn.workitem.id.x()
+ %base = mul i32 %bid, 128
+ %idx = add i32 %base, %tid
+ %i = zext i32 %idx to i64
+ %xp = getelementptr float, ptr addrspace(1) %x, i64 %i
+ %a = load volatile float, ptr addrspace(1) %xp, align 4
+ %twice = fmul float %a, 2.0
+ %live = fadd float %twice, 3.0
+ %sc = add i32 %seed, %bid
+ call void asm sideeffect "; MONO_BOUNDARY_0", "{s[0:1]},{s2},{v0},@CLOBBERS@"(ptr addrspace(4) %ka, i32 %bid, i32 %tid) #1
+ %tp = getelementptr float, ptr addrspace(1) %tmp1, i64 %i
+ %b = load volatile float, ptr addrspace(1) %tp, align 4
+ %mid = fadd float %live, %b
+ %sc2 = add i32 %sc, 1
+ %ka2 = getelementptr i8, ptr addrspace(4) %ka, i64 8
+ call void asm sideeffect "; MONO_BOUNDARY_1", "{s[0:1]},{s2},{v0},@CLOBBERS@"(ptr addrspace(4) %ka2, i32 %bid, i32 %tid) #1
+ %tp2 = getelementptr float, ptr addrspace(1) %tmp2, i64 %i
+ %c = load volatile float, ptr addrspace(1) %tp2, align 4
+ %v = fadd float %mid, %c
+ %sf = uitofp i32 %sc2 to float
+ %result = fadd float %v, %sf
+ %op = getelementptr float, ptr addrspace(1) %out, i64 %i
+ store volatile float %result, ptr addrspace(1) %op, align 4
+ ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="128,128" "target-cpu"="gfx1100" }
+attributes #1 = { convergent noduplicate nounwind }

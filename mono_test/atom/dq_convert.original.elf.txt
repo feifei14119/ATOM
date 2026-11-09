@@ -1,0 +1,138 @@
+ELF Header:
+  Magic:   7f 45 4c 46 02 01 01 40 04 00 00 00 00 00 00 00
+  Class:                             ELF64
+  Data:                              2's complement, little endian
+  Version:                           1 (current)
+  OS/ABI:                            AMDGPU - HSA
+  ABI Version:                       4
+  Type:                              DYN (Shared object file)
+  Machine:                           EM_AMDGPU
+  Version:                           0x1
+  Entry point address:               0x0
+  Start of program headers:          64 (bytes into file)
+  Start of section headers:          4976 (bytes into file)
+  Flags:                             0x449, gfx1250, sramecc
+  Size of this header:               64 (bytes)
+  Size of program headers:           56 (bytes)
+  Number of program headers:         8
+  Size of section headers:           64 (bytes)
+  Number of section headers:         15
+  Section header string table index: 13
+There are 15 section headers, starting at offset 0x1370:
+
+Section Headers:
+  [Nr] Name              Type            Address          Off    Size   ES Flg Lk Inf Al
+  [ 0]                   NULL            0000000000000000 000000 000000 00      0   0  0
+  [ 1] .note             NOTE            0000000000000200 000200 0004dc 00   A  0   0  4
+  [ 2] .dynsym           DYNSYM          00000000000006e0 0006e0 000048 18   A  5   1  8
+  [ 3] .gnu.hash         GNU_HASH        0000000000000728 000728 000024 00   A  2   0  8
+  [ 4] .hash             HASH            000000000000074c 00074c 000020 04   A  2   0  4
+  [ 5] .dynstr           STRTAB          000000000000076c 00076c 000058 00   A  0   0  1
+  [ 6] .rodata           PROGBITS        0000000000000800 000800 000040 00   A  0   0 64
+  [ 7] .text             PROGBITS        0000000000001900 000900 000800 00  AX  0   0 256
+  [ 8] .dynamic          DYNAMIC         0000000000003100 001100 000070 10  WA  5   0  8
+  [ 9] .relro_padding    NOBITS          0000000000003170 001170 000e90 00  WA  0   0  1
+  [10] .sp3.notes        PROGBITS        0000000000000000 001170 000051 00      0   0  1
+  [11] .comment          PROGBITS        0000000000000000 0011c1 00006b 01  MS  0   0  1
+  [12] .symtab           SYMTAB          0000000000000000 001230 000060 18     14   2  8
+  [13] .shstrtab         STRTAB          0000000000000000 001290 00007b 00      0   0  1
+  [14] .strtab           STRTAB          0000000000000000 00130b 000061 00      0   0  1
+Key to Flags:
+  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),
+  L (link order), O (extra OS processing required), G (group), T (TLS),
+  C (compressed), x (unknown), o (OS specific), E (exclude),
+  R (retain), p (processor specific)
+
+There are no relocations in this file.
+
+Symbol table '.dynsym' contains 3 entries:
+   Num:    Value          Size Type    Bind   Vis       Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   UND 
+     1: 0000000000001900     0 FUNC    GLOBAL PROTECTED   7 _ZN5aiter29fmha_bwd_hd64_dq_convert_bf16E
+     2: 0000000000000800    64 OBJECT  GLOBAL DEFAULT     6 _ZN5aiter29fmha_bwd_hd64_dq_convert_bf16E.kd
+
+Symbol table '.symtab' contains 4 entries:
+   Num:    Value          Size Type    Bind   Vis       Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   UND 
+     1: 0000000000003100     0 NOTYPE  LOCAL  HIDDEN      8 _DYNAMIC
+     2: 0000000000001900     0 FUNC    GLOBAL PROTECTED   7 _ZN5aiter29fmha_bwd_hd64_dq_convert_bf16E
+     3: 0000000000000800    64 OBJECT  GLOBAL DEFAULT     6 _ZN5aiter29fmha_bwd_hd64_dq_convert_bf16E.kd
+Displaying notes found in: .note
+  Owner                Data size 	Description
+  AMDGPU               0x000004c5	NT_AMDGPU_METADATA (AMDGPU Metadata)
+    AMDGPU Metadata:
+        ---
+amdhsa.kernels:
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_write
+        .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         32
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         48
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         64
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         80
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         96
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         112
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         128
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         144
+        .size:           4
+        .value_kind:     by_value
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         160
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         176
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         192
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         208
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         224
+        .size:           4
+        .value_kind:     by_value
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 240
+    .max_flat_workgroup_size: 128
+    .name:           _ZN5aiter29fmha_bwd_hd64_dq_convert_bf16E
+    .private_segment_fixed_size: 0
+    .sgpr_count:     48
+    .symbol:         _ZN5aiter29fmha_bwd_hd64_dq_convert_bf16E.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     46
+    .wavefront_size: 32
+    .workgroup_processor_mode: 1
+amdhsa.target:   amdgcn-amd-amdhsa--gfx1250
+amdhsa.version:
+  - 1
+  - 2
+...
+

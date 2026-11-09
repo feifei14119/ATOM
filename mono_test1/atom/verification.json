@@ -1,0 +1,24 @@
+{
+  "status": "PASS: static audit and gfx1250 compile/link; GPU not run",
+  "compiler": "AMD clang version 22.0.0git (https://github.com/RadeonOpenCompute/llvm-project roc-7.2.0 26014 7b800a19466229b8479a78de19143dc33c3ab9b5)",
+  "fragment_bytes": 1604,
+  "unchanged_supplier_bytes": 1200,
+  "inline_instances_in_caller": 2,
+  "caller_resource_values": {
+    "vgpr_count": 46,
+    "sgpr_count": 49,
+    "vgpr_spill_count": 0,
+    "sgpr_spill_count": 0,
+    "private_segment_fixed_size": 0,
+    "group_segment_fixed_size": 0,
+    "wavefront_size": 32
+  },
+  "fixed_input_constraints_checked": true,
+  "clobber_coverage_checked": true,
+  "exec_and_mode_paths_checked": true,
+  "tile_layout_bijection_checked": true,
+  "descriptor_allocation_checked": true,
+  "ir_or_descriptor_patched": false,
+  "gpu_execution": false,
+  "production_atom_integration": false
+}

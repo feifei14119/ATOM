@@ -1,0 +1,120 @@
+{
+  "symbol": "mono_dq_convert_device",
+  "target": "gfx1250",
+  "wave_size": 32,
+  "elf_type": "ET_REL",
+  "calling_convention": "ordinary HIP/LLVM C device function; default CSR_AMDGPU",
+  "vgpr_count": 55,
+  "numbered_sgpr_count": 48,
+  "agpr_count": 0,
+  "private_frame_bytes": 0,
+  "lds_bytes": 0,
+  "named_barriers": 0,
+  "entry": {
+    "args": "v0:v1; uniform global pointer to aligned 240-byte block",
+    "linear_tid": "v2; physical 1D threadIdx.x",
+    "EXEC": "all 32 lanes active",
+    "vgpr_bank": 0,
+    "block_threads": [
+      128,
+      256
+    ]
+  },
+  "preserves_written_sgprs": [
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38
+  ],
+  "preserves_written_vgprs": [
+    40,
+    41,
+    42,
+    43,
+    44,
+    45
+  ],
+  "sgpr_backups": {
+    "s30:s37": "s40:s47",
+    "s38": "s5"
+  },
+  "vgpr_backups": {
+    "v40:v45": "v48:v53",
+    "MODE[7:0]": "v54"
+  },
+  "mode_during_payload_low8": 192,
+  "mode_restored": true,
+  "virtual_grid": [
+    0,
+    0,
+    0
+  ],
+  "tile": [
+    64,
+    64
+  ],
+  "original_assembly_sha256": "4050f8e1eacf2463c98adeb8f2aeee2ca93e2792de3a43e58088cbd36a05a711",
+  "patches": [
+    {
+      "original_offset": 4,
+      "old_words": [
+        "8B01FF01",
+        "0000FFFF"
+      ],
+      "new_instructions": [
+        "s_nop 0",
+        "s_nop 0"
+      ]
+    },
+    {
+      "original_offset": 100,
+      "old_words": [
+        "BE820075"
+      ],
+      "new_instructions": [
+        "s_mov_b32 s2, 0"
+      ]
+    },
+    {
+      "original_offset": 104,
+      "old_words": [
+        "8B03FF73",
+        "0000FFFF"
+      ],
+      "new_instructions": [
+        "s_mov_b32 s3, 0",
+        "s_nop 0"
+      ]
+    },
+    {
+      "original_offset": 112,
+      "old_words": [
+        "9304FF73",
+        "00100010"
+      ],
+      "new_instructions": [
+        "s_mov_b32 s4, 0",
+        "s_nop 0"
+      ]
+    },
+    {
+      "original_offset": 120,
+      "old_words": [
+        "9318FF74",
+        "00050019"
+      ],
+      "new_instructions": [
+        "s_nop 0",
+        "s_nop 0"
+      ]
+    }
+  ],
+  "caller_resource_merge_required": true,
+  "scratch_allowed_in_caller": true,
+  "gpu_validation": "pending: no gfx1250 GPU locally"
+}

@@ -1,0 +1,37 @@
+ELF Header:
+  Magic:   7f 45 4c 46 02 01 01 40 04 00 00 00 00 00 00 00
+  Class:                             ELF64
+  Data:                              2's complement, little endian
+  Version:                           1 (current)
+  OS/ABI:                            AMDGPU - HSA
+  ABI Version:                       4
+  Type:                              REL (Relocatable file)
+  Machine:                           EM_AMDGPU
+  Version:                           0x1
+  Entry point address:               0x0
+  Start of program headers:          0 (bytes into file)
+  Start of section headers:          2968 (bytes into file)
+  Flags:                             0x549, gfx1250, xnack, sramecc
+  Size of this header:               64 (bytes)
+  Size of program headers:           0 (bytes)
+  Number of program headers:         0
+  Size of section headers:           64 (bytes)
+  Number of section headers:         5
+  Section header string table index: 1
+
+There are no relocations in this file.
+
+Symbol table '.symtab' contains 12 entries:
+   Num:    Value          Size Type    Bind   Vis       Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   UND 
+     1: 0000000000000037     0 NOTYPE  LOCAL  DEFAULT   ABS mono_dq_convert_device.num_vgpr
+     2: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS mono_dq_convert_device.num_agpr
+     3: 0000000000000030     0 NOTYPE  LOCAL  DEFAULT   ABS mono_dq_convert_device.numbered_sgpr
+     4: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS mono_dq_convert_device.num_named_barrier
+     5: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS mono_dq_convert_device.private_seg_size
+     6: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS mono_dq_convert_device.uses_vcc
+     7: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS mono_dq_convert_device.uses_flat_scratch
+     8: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS mono_dq_convert_device.has_dyn_sized_stack
+     9: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS mono_dq_convert_device.has_recursion
+    10: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS mono_dq_convert_device.has_indirect_call
+    11: 0000000000000000  1756 FUNC    GLOBAL HIDDEN      2 mono_dq_convert_device

@@ -1,18 +1,12 @@
-# Mono：用 C++ inline asm 的 .long 嵌入二进制阶段
+# Mono：直接使用固定寄存器输入约束 + .long
 
-本目录复现 `../mono_test0` 的相同主 kernel、六参数接口与三 CTA 流程。差别在于减一阶段：其机器码通过 **C++ inline asm 的 `.long` 指令字**进入主 kernel，在 LLVM 寄存器分配之前就带有输入和 clobber 约束。
+已在 [stages/sub.h](stages/sub.h) 中验证：ROCm 7.2 的 AMDGPU Clang 可以直接在 C++ inline asm 中使用 `"{v0}"(a)`，让编译器在进入 ASM 时将 32 位变量 a 放入 v0。无需在 ASM 内手写 `v_mov_b32 v0, ...`，也无需 C++ `register ... asm("v0")` 变量。
 
-```text
-CTA 0：inline asm / .long → first = input - 1 → 发布 first
-CTA 1：等待 first → stage_scale → second = first * 2 → 发布 second
-CTA 2：等待 second → stage_relu → output = max(second - 3, 0)
-```
-
-最终公式仍为 `y[i] = max(2*x[i] - 5, 0)`。scale/relu 保持原来的 C++ 内联阶段。host、参数布局和 mailbox 代码从 `mono_test0` 直接复制。
+当前版本已采用这套写法。`.long` 机器指令体和三 CTA 算法不变；输入约束、实际破坏的寄存器以及 memory 均直接写在 `asm volatile` 中，没有全函数 VGPR/SGPR 数量上限，也没有 IR/MIR 修改脚本。
 
 ## 构建与运行
 
-使用 ROCm 7.2 和 gfx1100 / Radeon RX 7900 XTX，本机设备编号为 0。
+环境：ROCm 7.2，clang 提交 `7b800a19466229b8479a78de19143dc33c3ab9b5`，gfx1100 / Radeon RX 7900 XTX。
 
 ```bash
 cd /home/feifei/repo/ATOM/mono_test1
@@ -21,121 +15,107 @@ make run
 make check
 ```
 
-- `make run`：一次 cooperative launch，3 CTA × 128 threads，核对 4096 个元素的两个中间值、最终结果和两个发布标记。
-- `make check`：生成汇编/反汇编，验证真实 inline asm 输入与 clobber、完整指令字节和无设备调用返回。
-- `make inspect`：只生成可阅读的 LLVM IR、汇编、反汇编和 ELF 信息。
-- `make clean`：删除构建目录。
-
-## 从哪里阅读
-
-| 文件 | 内容 |
-| --- | --- |
-| [mono_kernel.cpp](mono_kernel.cpp) | 与 mono_test0 相同的三 CTA 分派，减一改为 stage_sub_inline |
-| [stages/sub.h](stages/sub.h) | **核心实现**：固定寄存器输入、真实 asm volatile、`.long` include 和 clobber |
-| [build/sub_words.inc](build/sub_words.inc) | `.long 0x...` 的 C++ 字符串字面量，每行注释对应指令 |
-| [stages/sub_kernel.s](stages/sub_kernel.s) | mono_test0 原始设备函数汇编的副本，机器指令未改写 |
-| [stages/scale.h](stages/scale.h)、[stages/relu.h](stages/relu.h) | 乘二和 ReLU 阶段 |
-| [embed_sub.py](embed_sub.py) | 从 `.co` 取出固定函数，移除唯一末尾 return，生成 `.long` 字符串 |
-| [Makefile](Makefile) | 编译、嵌入、链接流程 |
-| [build/mono_kernel.ll](build/mono_kernel.ll) | 寄存器分配前的 asm sideeffect 及全部约束 |
-| [build/mono_kernel.disasm.txt](build/mono_kernel.disasm.txt) | 最终主 kernel 的实际指令 |
-
-## `.long` 实际如何嵌入
+运行的仍是 `mono_kernel.cpp` 主 Mono，3 CTA × 128 threads：
 
 ```text
-stages/sub_kernel.s
-    → assembler → build/stage_sub.co（ELF REL）
-    → embed_sub.py → build/sub_words.inc（288 B 的机器指令字）
-                             ↓ #include 到 asm volatile 内
-mono_kernel.cpp + stages/sub.h + scale.h + relu.h
-    → HIP / LLVM IR（这里已经有 .long 和固定寄存器约束）
-    → 正常寄存器分配与代码生成 → mono_kernel.o
-    → ld.lld → mono_kernel.co
+CTA 0：.long 减一 → first = input - 1 → 发布 first
+CTA 1：stage_scale → second = first * 2 → 发布 second
+CTA 2：stage_relu → output = max(second - 3, 0)
 ```
 
-最终链接只传 `mono_kernel.o`。`stage_sub.co` 用作构建时的机器码输入，不作为链接输入，也不作为运行时调用目标。没有事后修改 Mono 汇编或二进制的步骤；`make inspect` 产生的 `.s` 仅供阅读。
+公式为 `y[i] = max(2*x[i] - 5, 0)`。host、六参数接口、mailbox、scale/relu 和原始供应方汇编保持不变。
 
-核心写法在 `stages/sub.h` 中：
+## 实际修改
+
+以前使用普通 `"v"` / `"s"` 输入，再在 ASM 内写 9 条 VGPR 和 3 条 SGPR 搬运。现在删除这 12 条手写搬运，直接指定输入位置，例如：
 
 ```cpp
 asm volatile(
-    "s_branch 1f\n"
-    ".p2align 6\n"
-    "1:\n"
-#include "sub_words.inc"   // 多个相邻的 ".long 0x...\n" 字符串
-    "s_waitcnt vmcnt(0) lgkmcnt(0)\n"
-    "s_waitcnt_vscnt null, 0\n"
-    "s_waitcnt_depctr 0\n"
+    // 等待、对齐与 .long 指令体……
     :
-    : /* 固定寄存器输入，完整列表见源文件 */
-    : /* 实际被覆盖的寄存器，以及 memory */);
+    : [in_lo] "{v0}"(static_cast<unsigned>(in)),
+      [in_hi] "{v1}"(static_cast<unsigned>(in >> 32))
+      // 其他固定输入……
+    : "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+      "s0", "s1", "s2", "s3", "vcc", "scc", "memory");
 ```
 
-这些 `.long` 被汇编到主 kernel 的可执行 `.text` 中。GPU 按机器指令执行它们；它们不是运行时读取的数据表。
+完整约束在 [sub.h](stages/sub.h) 中，包含 12 个 i32 输入：
 
-从供应方 292 B 函数中仅去掉最后 4 B 的 `s_setpc_b64 s[30:31]`，保留其余 288 B，包括内部短分支和对齐 NOP。外层直接分支跳过对齐填充，使 payload 仍按 64 B 对齐；末尾等待输出写入完成，随后直接继续编译器生成的代码。本示例 CTA 0 的下一步是结束该 CTA，CTA 1/2 继续消费 mailbox。
-
-## 编译器可见的边界
-
-原始指令字使用固定物理寄存器，因此必须明确描述其输入：
-
-| 输入 | 寄存器 |
+| 输入 | 固定输入约束 |
 | --- | --- |
-| input 指针 | v0:v1 |
-| first.data 指针 | v2:v3 |
-| first.tag 指针 | v4:v5 |
-| n / epoch | v6 / v7 |
-| threadIdx.x | v31 |
-| 隐式 launch 参数指针 | s8:s9 |
-| blockIdx.x | s12，本次在 CTA 0 分支中被优化为 0 |
+| input 指针低/高位 | `{v0}` / `{v1}` |
+| first.data 指针低/高位 | `{v2}` / `{v3}` |
+| first.tag 指针低/高位 | `{v4}` / `{v5}` |
+| n / epoch | `{v6}` / `{v7}` |
+| threadIdx.x | `{v31}` |
+| 隐式 launch 参数指针低/高位 | `{s8}` / `{s9}` |
+| blockIdx.x | `{s12}` |
 
-这版 Clang 的 C++ 局部寄存器变量只接受 `v0`、`s8` 等单寄存器名，不接受 `v[0:1]`。**不能把一个 uint64 直接绑定到 v0 并假定 v1 也会填入。** 本例将每个指针拆成两个 uint32，分别绑定 low/high；生成的 IR 有 12 个明确的 i32 输入。
+当前将 64 位指针拆为两个 uint32，每个单寄存器约束的位宽都与操作数一致。不要把完整 uint64 直接传给单个 `{v0}` 并假定高位也会自动放进 v1。
 
-对本固定供应方，净 clobber 为：
+这里使用的是 **asm 操作数约束字符串**。它和 `register ... asm("寄存器名")` 的变量寄存器名称语法不是同一个接口；不能根据后者对寄存器名称的限制，推断前者是否支持 `{v0}`。
+
+## 编译器是否还会生成 v_mov
+
+会按需生成。固定输入约束表示“进入 ASM 时，这个值必须在指定寄存器中”，不是“这个值从产生到销毁只能位于这里”，也不保证实现过程中完全没有搬运。
+
+当前生成的 [build/mono_kernel.s](build/mono_kernel.s) 中，在 `;;#ASMSTART` 之前出现：
+
+```asm
+s_add_u32 s8, s2, 56
+s_addc_u32 s9, s3, 0
+s_waitcnt lgkmcnt(0)
+v_dual_mov_b32 v0, s16 :: v_dual_mov_b32 v1, s17
+v_dual_mov_b32 v2, s20 :: v_dual_mov_b32 v3, s21
+v_dual_mov_b32 v4, s22 :: v_dual_mov_b32 v5, s23
+v_dual_mov_b32 v6, s10 :: v_dual_mov_b32 v7, s11
+s_mov_b32 s12, 0
+;;#ASMSTART
+```
+
+这是 LLVM 自动完成的参数准备：指针原本由 scalar load 装入 SGPR，需要进入指定 VGPR。ASM 内已经没有手写的入口移动。其他场景下，编译器可以将生产该值的指令结果直接安排到目标寄存器，也可能仍然需要复制；以实际生成代码为准。
+
+修改前的 sub.h、汇编和检查结果保存在 `build/fixed_binding_before/` 供本次对照，它们不参与当前构建，clean 后会删除。没有进行性能对比，不能仅按手写移动减少就宣称性能提升。
+
+## 为什么 clobber 也要调整
+
+删除 ASM 内的入口搬运后，v0–v7、v31、s8:s9 和 s12 都只是原体的只读输入，不再由这个 ASM 区域写入。它们不能同时作为只读固定输入和 clobber。
+
+当前实际 clobber 只保留：
 
 ```text
-s0–s3
-v8–v15
-VCC、SCC、memory
+v8–v15、s0–s3、VCC、SCC、memory
 ```
 
-其余输入寄存器保持原值。原体自己保存并恢复 EXEC，因此整个区域净效果不破坏 EXEC。它包含 CTA barrier，必须在 CTA 一致的控制流中由全部线程到达，不能把调用放在 `if (tid < n)` 内；n 小于 CTA 大小时的掩码由原体内部处理。
+如果以后机器码会改写某个固定输入，应将对应操作数正确建模为读写或输出，不能继续把它声明成只读输入。EXEC 由原体恢复；MODE 和栈状态不被修改。
 
-`asm volatile` 防止有副作用的区域被删除；生成的 IR call 带 `convergent`；`memory` 描述间接访问的 input/mailbox 内存。LLVM 根据这些约束分配调用方寄存器，并自然统计硬编码输入与 clobber 所需的资源。本例不需要手动修补 descriptor/metadata。
+该约束是局部接口：LLVM 仍能自行分配其他寄存器，按需保留跨区域活跃值或使用 scratch。不需要增加 `amdgpu_num_vgpr`、`amdgpu_num_sgpr`、自定义 regmask 或 IR 数量限制。此主示例 CTA 0 在区域之后结束，不能把当前零 scratch 结果当作大型 ATOM 中间算子的普遍保证。
 
-这里没有完整现场快照，也没有默认 device-call ABI 的 callee-saved 保存 wrapper。`.long` 本身不会保护任何寄存器：本例能成立，是因为已核对固定供应方的真实寄存器读写，并把净效果准确交给编译器。以后换成会破坏所有寄存器的 ASM，必须重新设计保存层和约束，不能直接沿用本表。
+## .long 与编译链
 
-## 与 mono_test0 的对照
-
-| 项目 | mono_test0 | mono_test1 |
-| --- | --- | --- |
-| 减一入口 | 普通外部设备函数调用 | 带约束的 inline asm |
-| 二进制使用方式 | 链接 stage_sub.co | 将函数体编码为 `.long` |
-| 最终链接输入 | caller.o + stage_sub.co | 只有 caller.o |
-| 编译器依据 | 默认设备函数 ABI | 固定输入 + clobber |
-| 阶段入口/出口 | PC call/return | 直接分支 + 顺序继续 |
-| 函数级 VGPR/SGPR 上限 | 无 | 无 |
-| scale/relu、计算公式、host 接口 | 相同 | 相同 |
-
-本例不强制零 scratch，也不对其他内联阶段添加寄存器上限。当前生成的主 kernel 恰好不需要 scratch；不能据此推断大型 ATOM Mono 同样不需要。
-
-如果供应方仅提供已审计的 `.co`，可以在新的构建目录使用：
-
-```bash
-make BUILD=build_receiver STAGE_CO=/absolute/path/stage_sub.co run
+```text
+stages/sub_kernel.s → stage_sub.co（ELF REL）
+    → embed_sub.py → build/sub_words.inc
+    → sub.h 的 asm volatile
+    → HIP 编译 → mono_kernel.bc → mono_kernel.o → mono_kernel.co
 ```
 
-这条依赖路径只读取供应方二进制，不要求本地 `sub_kernel.s`。更换供应方路径时使用新 BUILD 或先 clean。提取器固定验证函数 SHA，因此不接受未经重新审计的任意 `.co`。
+供应方函数为 292 B，移除最后 4 B 的设备 return 后，剩余 288 B 原样转换为 `.long` 字符串。内部相对分支和对齐 NOP 保持不变，最终写入主 kernel 的可执行 `.text`。
 
-## 已完成的验证
+最终只链接主 kernel 对象，没有外部 stage 调用，也不修改编译器输出的指令。`make inspect` 和 `make check` 生成的 `.ll` / `.s` 仅用于阅读检查，不参与输入改写。
 
-2026-11-09，ROCm 7.2 / gfx1100：
+原体包含 CTA barrier，必须完整 CTA 一致到达；n 小于 CTA 大小时的线程掩码由原体处理。原 mailbox 的 release/acquire 协议保持不变。
 
-- 默认 `make run` 验证 4096 元素通过。
-- 额外临时 host 使用同一份主 `mono_kernel.co` 验证 n=1、31、128、257，全部通过；临时源码和可执行文件未保留。不同大小可以通过修改 `mono_abi.h` 的 kElements 后重新构建复现。
-- 实际 LLVM IR 包含完整 `.long`、12 个 i32 输入、clobber 和 convergent 属性。
-- 最终可执行主函数中恰好包含一份 288 B payload，与供应方去掉末尾 return 后逐字节一致。
-- 主 kernel 无 `s_getpc_b64`、`s_swappc_b64`、`s_setpc_b64`，无外部 stage_sub_device 符号及未解析重定位。
-- 最终资源：VGPR 32、SGPR 26、LDS/private 0，VGPR/SGPR spill count 均为 0。
+## 本次验证结果
 
-记录见 [静态结果](build/verification.json) 和 [本次实机结果](build/gpu_verification.json)。这些结果证明本例的编写、编译与执行流程；没有做性能对比，也没有在本目录接入真实 ATOM 算子。
+2026-11-09，直接修改本目录的 sub.h，并编译运行同一个主 Mono：
+
+- C++ 直接接受 `{v0}` 等固定输入约束，生成的 LLVM IR 保留它们。
+- ASM 内手写入口搬运为 0，所有指针高/低位均由编译器正确准备。
+- `.long` payload 恰好出现一次、64 B 对齐、与原始去掉 return 的 288 B 逐字节一致。
+- 主 kernel 无 getpc/swappc/setpc，无外部 stage 符号或剩余重定位。
+- n=1、31、128、257、4096 的两个中间值、两个发布标记和最终输出全部通过。默认 host 测试 4096，其余尺寸用同一 `.co` 和临时 host 验证。
+- 最终资源：32 VGPR、26 SGPR，LDS/private/spill 均为 0。这些是生成结果，不是数量上限。
+
+结果见 [build/verification.json](build/verification.json) 与 [build/gpu_verification.json](build/gpu_verification.json)；后者记录了本次执行的 `.co` SHA-256。检查脚本 [verify.py](verify.py) 已同步更新，验证直接固定输入、只读输入不与 clobber 重叠以及 ASM 内无入口搬运。

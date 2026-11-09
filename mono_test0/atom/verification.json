@@ -1,0 +1,35 @@
+{
+  "status": "static_checks_passed; gfx1250_GPU_and_ATOM_integration_pending",
+  "toolchain": "AMD clang version 22.0.0git (https://github.com/RadeonOpenCompute/llvm-project roc-7.2.0 26014 7b800a19466229b8479a78de19143dc33c3ab9b5)",
+  "original_assembly_sha256": "4050f8e1eacf2463c98adeb8f2aeee2ca93e2792de3a43e58088cbd36a05a711",
+  "device_object_sha256": "9379f826f6f9d64d4c515f4be5a504ece6654d83aaae9b3fdd531540ec9f69dd",
+  "device_function_sha256": "1137364423e9232bbf40a99398d362f7caf77cb6eae8dd8b08ef8209a67b7369",
+  "device_function_bytes": 1756,
+  "original_function_bytes": 1528,
+  "original_reassembly_bytes_identical": true,
+  "unchanged_payload_bytes": 1488,
+  "patched_payload_bytes": 36,
+  "native_default_ABI_checked": true,
+  "callee_saved_symbolic_restore_passed": true,
+  "fp_mode_low8_restored": true,
+  "layout_elements_checked": 4096,
+  "header_host_and_device_compilation_passed": true,
+  "caller_argument_registers": [
+    "v0:v1=args",
+    "v2=linear_tid"
+  ],
+  "caller_live_value_in_v41": true,
+  "caller_instructions_modified": false,
+  "external_resource_constants_merged": true,
+  "linked_stage_bytes_unchanged": true,
+  "unresolved_symbols": 0,
+  "linked_resources": {
+    "vgpr_count": 55,
+    "sgpr_count": 50,
+    "private_segment_fixed_size": 0,
+    "vgpr_spill_count": 0,
+    "sgpr_spill_count": 0
+  },
+  "gpu_executed": false,
+  "ATOM_modified": false
+}

@@ -1,0 +1,10 @@
+{
+  "original_directory": "/home/feifei/repo/ATOM/mono_read/mono_test1/atom",
+  "method_reference": "/home/feifei/repo/ATOM/callee_test10/stage_api.h",
+  "original_sha256": "4050f8e1eacf2463c98adeb8f2aeee2ca93e2792de3a43e58088cbd36a05a711",
+  "adapted_sha256": "cce10dd2b5f0f82f344599c12df2416ec9553b93dc3183bc1608c5481bd65e28",
+  "adaptation": "Same source adaptation as mono_read; newly integrated into the FlyDSL Mono caller.",
+  "static_source_audit": "PASS: actual GPR writes match clobbers, fixed inputs read-only, EXEC/MODE protocol checked.",
+  "compilation": "NOT RUN",
+  "gpu_test": "NOT RUN"
+}

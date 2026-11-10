@@ -5,7 +5,7 @@ import struct
 
 import torch
 
-from hip_runtime import Buffer
+from mono_hip_runtime import Buffer
 from reference import exact
 
 TASKS, ELEMENTS, ARGS_BYTES = 112, 4096, 240

@@ -66,7 +66,7 @@ shell 默认总超时 900 秒，覆盖 JIT 编译和数值测试。kernel 内另
 | [run.sh](run.sh) | 一键入口、总超时、保存日志 |
 | [run_test.py](run_test.py) | 编译、资源检查、分配、单次 launch、读取输出、测试循环 |
 | [reference.py](reference.py) | CPU 输入生成、权重打包、独立数值参考和误差判定 |
-| [hip_runtime.py](hip_runtime.py) | HIP 分配/拷贝、内存 guard、实际二进制的 occupancy 查询 |
+| [mono_hip_runtime.py](mono_hip_runtime.py) | HIP 分配/拷贝、内存 guard、实际二进制的 occupancy 查询 |
 | [mono1250/kernels/reference_projection.py](mono1250/kernels/reference_projection.py) | Mono 主体及 WQKV stage |
 | [mono1250/kernels/reference_k1.py](mono1250/kernels/reference_k1.py) | gfx1250 slice stage |
 | [mono1250/kernels/reference_norm.py](mono1250/kernels/reference_norm.py) | gfx1250 RMSNorm / FP8 stage |

@@ -112,7 +112,7 @@ def compile_and_check(report, hip, stream, properties, variant):
 
 def run_cases(args, report, hip, stream, launchers, binary_shas):
     import torch
-    from hip_runtime import Buffer
+    from mono_hip_runtime import Buffer
     from reference import make_inputs, verify, exact, HIDDEN, HC, ROWS, MIX, SLICES
     from mono1250.kernels.reference_plan import C1ReferencePlan
     from mono1250.runtime.compile import _code_object
@@ -255,7 +255,8 @@ def main(args, report):
     from asm.audit import audit_source
     from callsite_regmask import preflight
     report["asm_source"] = audit_source()
-    llvm_bin = Path(args.llvm_bin).resolve()
+    from build_llc import ensure_llc
+    llvm_bin = ensure_llc(Path(args.llvm_bin))
     report["options"]["llvm_bin"] = str(llvm_bin)
     report["toolchain_preflight"] = preflight(llvm_bin)
     subprocess.run([sys.executable, str(ROOT / "asm/prepare.py"), "--llvm-bin", str(llvm_bin)], check=True)
@@ -265,7 +266,8 @@ def main(args, report):
     import aiter
     if not hasattr(rocdl, "WMMAScale"):
         raise RuntimeError("FlyDSL lacks rocdl.WMMAScale; install the gfx1250-capable AITER/FlyDSL environment")
-    from hip_runtime import Hip
+    # Not hip_runtime: aiter puts aiter/jit/utils (with its own hip_runtime.py) first on sys.path.
+    from mono_hip_runtime import Hip
     report["modules"] = {"flydsl": flydsl.__file__, "aiter": aiter.__file__}
     hip = Hip()
     report["hip_library"] = hip.path

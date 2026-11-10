@@ -2,7 +2,11 @@
 import hashlib
 import re
 import struct
-from .prepare import ROOT, SYMBOL, SOURCE_SHA, Elf, run, render, disassembly_rows
+from .prepare import ROOT, SYMBOL, SOURCE_SHA, Elf, run, render, symbol_rows
+
+# gfx1250 disassembly may use either spelling.
+RETURN = ('s_setpc_b64 s[30:31]', 's_set_pc_i64 s[30:31]')
+CALL = r'\bs_(?:swappc_b64|swap_pc_i64)\b'
 
 
 def instructions(text):
@@ -60,11 +64,11 @@ def audit_object(path, llvm):
     assert resource == dict(num_vgpr=70, numbered_sgpr=49, num_agpr=0, private_seg_size=0, num_named_barrier=0)
     dis = run([llvm/'llvm-objdump', '--mcpu=gfx1250', '--disassemble-symbols='+SYMBOL, path])
     path.with_suffix('.disasm.txt').write_text(dis)
-    rows = disassembly_rows(dis)
-    assert rows and rows[-1][0] == 's_setpc_b64 s[30:31]'
+    rows = symbol_rows(dis, obj, SYMBOL)
+    assert rows and rows[-1][0] in RETURN
     decoded = b''.join(struct.pack('<I', int(word, 16)) for _, _, words in rows for word in words)
     assert decoded == obj.blob(SYMBOL), 'Disassembly does not cover the complete function'
-    assert not any(re.search(r'\b(?:scratch_|s_endpgm|s_swappc)', i) for i, _, _ in rows)
+    assert not any(re.search(r'\b(?:scratch_|s_endpgm|s_swappc|s_swap_pc)', i) for i, _, _ in rows)
     result.update(symbol=SYMBOL, resources=resource, function_bytes=len(obj.blob(SYMBOL)),
                   function_sha256=hashlib.sha256(obj.blob(SYMBOL)).hexdigest())
     return result
@@ -77,7 +81,7 @@ def audit_linked(path, stage, symbol, resource, llvm):
     assert resource['vgpr'] >= 70 and resource['sgpr'] >= 49
     assert not [n for n, info in obj.symbols.items() if info[0] == 0], 'Undefined ELF symbols'
     dis = run([llvm/'llvm-objdump', '--mcpu=gfx1250', '--disassemble-symbols='+symbol, path])
-    assert len(re.findall(r'\bs_swappc_b64\b', dis)) == 1, 'Expected one real device call'
+    assert len(re.findall(CALL, dis)) == 1, 'Expected one real device call'
     return {'linked_supplier_bytes_identical': True, 'real_device_calls': 1,
             'supplier_sha256': hashlib.sha256(supplier.blob(SYMBOL)).hexdigest(),
             'vgpr_floor': 70, 'numbered_sgpr_floor': 49}

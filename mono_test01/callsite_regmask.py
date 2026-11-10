@@ -12,7 +12,7 @@ import re
 from regmask_tables import Elf, run, native_mask, low_mask
 from asm.prepare import SYMBOL
 
-LLVM_COMMIT = '7b800a19466229b8479a78de19143dc33c3ab9b5'
+LLVM_COMMIT = 'd177931e65e6057dca59f1c5b95e643d29876db3'
 
 
 def preflight(llvm):
@@ -80,8 +80,11 @@ def compile_caller(bitcode, stage, symbol, out, llvm, llvm_options=None):
     for operand in re.findall(r'\bimplicit(?: killed)? \$(vgpr\d+(?:_vgpr\d+)*)', target_calls[0]):
         implicit_vgprs.update(int(n) for n in re.findall(r'vgpr(\d+)', operand))
     assert {0, 1, 2} <= implicit_vgprs, target_calls[0]
-    mir, normalized = re.subn(r'^(\s*S_CBRANCH_VCC(?:NZ|Z) [^\n]*\$vcc_lo)\s*$',
-                             r'\1, implicit undef $vcc', mir, flags=re.M)
+    # The wave32 MIR printer writes $vcc_lo, but the parser requires the
+    # descriptor's implicit $vcc on these opcodes.
+    mir, normalized = re.subn(
+        r'^(\s*(?:S_CBRANCH_VCC(?:NZ|Z) |[^\n]*\bV_DIV_FMAS_F(?:32|64)_e64 )[^\n]*?implicit (?:killed )?\$vcc_lo)\b',
+        r'\1, implicit undef $vcc', mir, flags=re.M)
     roundtrip_mir = out/'caller.roundtrip.mir'
     roundtrip_mir.write_text(mir)
     roundtrip_s = out/'caller.roundtrip.raw.s'

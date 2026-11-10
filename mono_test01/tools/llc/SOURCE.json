@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/ROCm/llvm-project.git",
+  "commit": "d177931e65e6057dca59f1c5b95e643d29876db3",
+  "path": "llvm/tools/llc",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "modified": false,
+  "sha256": {
+    "llc.cpp": "9b98f84e42ac6166bcfcb14d1535ce5ff5d93fc25b54e3ed6c3f28aa8b0f3a13",
+    "NewPMDriver.cpp": "fe786c302995287b4e1e1bc5165fc12a71845f75e565ddd5eb9b14c20e508d3b",
+    "NewPMDriver.h": "ef39b34ee1a48a14a262db58544d32793f8d5cb5bb1f1d40deabb4b0ad2c28ff"
+  }
+}

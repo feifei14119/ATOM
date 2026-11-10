@@ -111,7 +111,7 @@ def compile_and_check(report, hip, stream, properties, variant):
 
 def run_cases(args, report, hip, stream, launchers, binary_shas):
     import torch
-    from hip_runtime import Buffer
+    from mono_hip_runtime import Buffer
     from reference import make_inputs, verify, exact, HIDDEN, HC, ROWS, MIX, SLICES
     from mono1250.kernels.reference_plan import C1ReferencePlan
     from mono1250.runtime.compile import _code_object
@@ -265,7 +265,8 @@ def main(args, report):
     report["options"]["llvm_bin"] = str(llvm_bin)
     report["wrapper_build"] = build(llvm_bin)
     write_report(report)
-    from hip_runtime import Hip
+    # Not hip_runtime: aiter puts aiter/jit/utils (with its own hip_runtime.py) first on sys.path.
+    from mono_hip_runtime import Hip
     report["modules"] = {"flydsl": flydsl.__file__, "aiter": aiter.__file__}
     hip = Hip()
     report["hip_library"] = hip.path

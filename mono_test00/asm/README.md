@@ -48,5 +48,5 @@ Mono 固定 256 threads/CTA、wave32；全 CTA 统一到达包装器调用，调
 供应方前四个 wave 执行转换，其他 wave 跳过；全 wave 的 EXEC 与 MODE 要满足入口/出口约定。
 参数对应的虚拟 grid x/y/z 都是 0，真实 task 已由指针和参数记录选定。
 
-本机 `.bc` 和离线包装器汇编已生成；完整 Mono 编译与 GPU 结果尚未验证。详见
-[主说明](../README.md) 中的构建证据和目标机器检查步骤。
+完整 Mono 编译与 gfx1250 GPU A/B 单测已通过。Clang 23 对未使用 src2 字段的编码差异，
+以及 GPU 运行结果，详见[主说明](../README.md)中的“工具链兼容性”和“gfx1250 运行结果”。

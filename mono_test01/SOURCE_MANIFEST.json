@@ -1,0 +1,220 @@
+{
+  "repository": "https://github.com/ROCm/ATOM",
+  "commit": "7c925f72b22ee6a815fd6d63734bbcff5fa72a08",
+  "files": [
+    {
+      "upstream": "atom/mono/device/ops.py",
+      "local": "mono1250/device/ops.py",
+      "upstream_sha256": "7cde6cbfd044bf4cdfce9d17c400720d3c309b43ebadc4be42fe5ae5bb6e6417",
+      "local_sha256": "b7319779f42cfcdebc211bf333a59452db697ea823fb5a1687350ca3983b6310"
+    },
+    {
+      "upstream": "atom/mono/device/mx.py",
+      "local": "mono1250/device/mx.py",
+      "upstream_sha256": "8aaf95a7042b80dc78b3239d07d0bb7223f7e58692f569cdff1b3545250abe22",
+      "local_sha256": "b95c08bdf5c9c02539aeba2206a742fb23a7e8ba3de61bd4611e8792cde70feb"
+    },
+    {
+      "upstream": "atom/mono/device/sync.py",
+      "local": "mono1250/device/sync.py",
+      "upstream_sha256": "47808e155cda57254a55b22e60e66d629f9dc3748c6f580f2002fde6ef9095a1",
+      "local_sha256": "8a9202a50df7eb30245b67ee42f85a68ccb7ba6c1ef14c88837b10b7a2144dce"
+    },
+    {
+      "upstream": "atom/mono/plan/execution.py",
+      "local": "mono1250/plan/execution.py",
+      "upstream_sha256": "2b1dd051eeb002d19a0ff43cbaadb8e5544fb11f6019f12c16b0e3a30d22ee45",
+      "local_sha256": "2b1dd051eeb002d19a0ff43cbaadb8e5544fb11f6019f12c16b0e3a30d22ee45"
+    },
+    {
+      "upstream": "atom/mono/plan/layout.py",
+      "local": "mono1250/plan/layout.py",
+      "upstream_sha256": "cf3bf177185af3fa9c450111108429dad17146162c5097bac12df54e6cb3284a",
+      "local_sha256": "70e49202e6c58462627c7ab3cc2c9253ee7de61c125de79b35a6ed42e41734dc"
+    },
+    {
+      "upstream": "atom/mono/plan/trace.py",
+      "local": "mono1250/plan/trace.py",
+      "upstream_sha256": "d261c8f14b0330a2f7834038f35a8be5e4711caee4cd3f13c2091065a4c74631",
+      "local_sha256": "d261c8f14b0330a2f7834038f35a8be5e4711caee4cd3f13c2091065a4c74631"
+    },
+    {
+      "upstream": "atom/mono/plan/shard.py",
+      "local": "mono1250/plan/shard.py",
+      "upstream_sha256": "bb44187af8ccc1e26070a14b781b0bb051d1b1be74e510bdd4dea2aa2d3ee73a",
+      "local_sha256": "bb44187af8ccc1e26070a14b781b0bb051d1b1be74e510bdd4dea2aa2d3ee73a"
+    },
+    {
+      "upstream": "atom/mono/plan/arith.py",
+      "local": "mono1250/plan/arith.py",
+      "upstream_sha256": "c4f9475da212023e97697a0948667d175b07b5a2dd578bb5df156b8a46411420",
+      "local_sha256": "c4f9475da212023e97697a0948667d175b07b5a2dd578bb5df156b8a46411420"
+    },
+    {
+      "upstream": "atom/mono/plan/check.py",
+      "local": "mono1250/plan/check.py",
+      "upstream_sha256": "c6a00789411815e3d4a26153410f8823e16a29fc70eca4c21ebad93c6c426713",
+      "local_sha256": "5045952dd2f799cfe65360938f7f29819d057e1c09fb9d8cccb384fb7c346835"
+    },
+    {
+      "upstream": "atom/mono/runtime/compile.py",
+      "local": "mono1250/runtime/compile.py",
+      "upstream_sha256": "b4597e0ead714abccec27634c615a5cdcd9d1e3f563398f7f644a3c20d2b63da",
+      "local_sha256": "b924f43f89fa1134a2aea09f622445b275c293089e7d3874529bb1ba25841dea"
+    },
+    {
+      "upstream": "atom/models/deepseek_v41/mono/gfx1250/kernels/reference_k1.py",
+      "local": "mono1250/kernels/reference_k1.py",
+      "upstream_sha256": "ddc9f80eb4dd0a09e8ed6bdc04e87e1a548f9a58605bd7bc20e8060f8ab3febd",
+      "local_sha256": "95a7b6a8e2a2919832cab2199d3f261f7216623ce2f9fa9585724c5a766399b5"
+    },
+    {
+      "upstream": "atom/models/deepseek_v41/mono/gfx1250/kernels/reference_norm.py",
+      "local": "mono1250/kernels/reference_norm.py",
+      "upstream_sha256": "521562a92c1594f139bf5a44876bd32d299035dd5e5b47e90a638afb06d8c573",
+      "local_sha256": "09610e4cc4b00c3d8afb7d8fd6be4331f101f713cad4e2e18a2ae5cb943ddb34"
+    },
+    {
+      "upstream": "atom/models/deepseek_v41/mono/gfx1250/kernels/reference_projection.py",
+      "local": "mono1250/kernels/reference_projection.py",
+      "upstream_sha256": "bea13fe961261443dc51dc78ba8f1d81e011cc63ea84c8b72d4cd78692b8ad85",
+      "adaptation": "Enable existing bounded diagnostic mailbox; compute stages unchanged.",
+      "local_sha256": "1bafb2ec8958676784df9db2e9271f7e71a2ade2683269be67ae696d50ba6816"
+    },
+    {
+      "upstream": "atom/models/deepseek_v41/mono/gfx1250/kernels/reference_plan.py",
+      "local": "mono1250/kernels/reference_plan.py",
+      "upstream_sha256": "07985634b9fcaa81c11dd032bcc6d3992235d9c01896ab47333d462fc1898af9",
+      "local_sha256": "a8cebe99b5f109241e155458e620190ca5731fd8a49957b3e9768172adcfd856"
+    },
+    {
+      "upstream": "atom/models/deepseek_v41/mono/gfx1250/kernels/reference_sync.py",
+      "local": "mono1250/kernels/reference_sync.py",
+      "upstream_sha256": "7df31771fd507ee7c7bcdecbcc71a93b2788945bb19eab3fb8ae4b3445984598",
+      "local_sha256": "8c4e19990e53ee81141ff45a2ea223df226e9f4abe1725e9dcbd27b4247e1ef3"
+    },
+    {
+      "upstream": "atom/models/deepseek_v41/mono/kernels/dims.py",
+      "local": "mono1250/kernels/dims.py",
+      "upstream_sha256": "be12c694f3fe39882641e757f20bd43c08a0dcab78b2fc876809db0161a80636",
+      "local_sha256": "97b4687bae828fbb5d8c1050160085f101081d2045f72a1c19212a47634d2ea3"
+    },
+    {
+      "upstream": "atom/models/deepseek_v41/mono/index_plan.py",
+      "local": "mono1250/index_plan.py",
+      "upstream_sha256": "74e3831747eb2eb10582b462916bf12c7092d098689fb59d4f53546d4bb4190d",
+      "local_sha256": "1d5209a80d4592708c60a416a59941fffafbc521e647165618b27c7e07868fc3"
+    },
+    {
+      "upstream": "atom/models/deepseek_v41/mono/kernels/attn_pre.py",
+      "local": "mono1250/kernels/attn_helpers.py",
+      "upstream_sha256": "7619f42b466ee07f1253d303b88f4e437c92189168bc40610d2a0ebf955adead",
+      "selected_line_ranges": [
+        [
+          112,
+          112
+        ],
+        [
+          113,
+          113
+        ],
+        [
+          114,
+          114
+        ],
+        [
+          119,
+          119
+        ],
+        [
+          125,
+          125
+        ],
+        [
+          126,
+          126
+        ],
+        [
+          127,
+          127
+        ],
+        [
+          130,
+          130
+        ],
+        [
+          135,
+          135
+        ],
+        [
+          231,
+          232
+        ],
+        [
+          240,
+          241
+        ],
+        [
+          244,
+          247
+        ],
+        [
+          268,
+          268
+        ],
+        [
+          271,
+          272
+        ],
+        [
+          275,
+          277
+        ],
+        [
+          306,
+          312
+        ],
+        [
+          316,
+          344
+        ],
+        [
+          347,
+          349
+        ],
+        [
+          352,
+          361
+        ],
+        [
+          364,
+          383
+        ],
+        [
+          386,
+          397
+        ],
+        [
+          405,
+          409
+        ],
+        [
+          819,
+          846
+        ],
+        [
+          849,
+          859
+        ]
+      ],
+      "local_sha256": "e4c714c03c93cd2ff7cd904bca341cb1d87f12c90493ae21cf1f0a82c8e397b9"
+    }
+  ],
+  "generated_packages": [
+    "mono1250/__init__.py",
+    "mono1250/device/__init__.py",
+    "mono1250/kernels/__init__.py",
+    "mono1250/plan/__init__.py",
+    "mono1250/runtime/__init__.py"
+  ]
+}

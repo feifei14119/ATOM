@@ -5,6 +5,6 @@
   "adapted_sha256": "cce10dd2b5f0f82f344599c12df2416ec9553b93dc3183bc1608c5481bd65e28",
   "adaptation": "Same source adaptation as mono_read; newly integrated into the FlyDSL Mono caller.",
   "static_source_audit": "PASS: actual GPR writes match clobbers, fixed inputs read-only, EXEC/MODE protocol checked.",
-  "compilation": "NOT RUN",
-  "gpu_test": "NOT RUN"
+  "compilation": "PASS (ROCm 7.16, AMD clang 23.0.0git d177931e)",
+  "gpu_test": "PASS: 9 native/inline A/B pairs bitwise identical on gfx1250"
 }

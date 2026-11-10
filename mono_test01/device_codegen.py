@@ -62,28 +62,41 @@ def compile_module(source, config, symbol, llvm, out):
     return result, report
 
 
+def lowered_source(jf, module, arch, link_libs):
+    """Repeat MlirCompiler.compile's steps before its pass pipeline (FlyDSL 0.4)."""
+    if link_libs:
+        raise RuntimeError('extern link_libs are not supported by the lowctx hook')
+    module.operation.verify()
+    backend = jf.get_backend(arch=arch)
+    hints = jf.CompilationContext.get_compile_hints()
+    module = jf.ir.Module.parse(module.operation.get_asm(enable_debug_info=jf.env.debug.enable_debug_info))
+    backend.lower_compile_hints(module, compile_hints=hints)
+    return str(module), jf._pipeline_fragments_for_mode(backend, compile_hints=hints)
+
+
 @contextmanager
 def lowctx_codegen(symbol, llvm, out):
     import flydsl.compiler.jit_function as jf
     cls = getattr(jf, 'MlirCompiler', None)
     if cls is None or 'compile' not in cls.__dict__:
-        raise RuntimeError('This integration requires FlyDSL MlirCompiler.compile(asm, *, func_name, config). '
-                           'Installed FlyDSL is incompatible; no fallback to the default ABI is allowed.')
+        raise RuntimeError('This integration requires FlyDSL MlirCompiler.compile(module, *, arch, func_name, '
+                           'link_libs). Installed FlyDSL is incompatible; no fallback to the default ABI is allowed.')
     descriptor = cls.__dict__['compile']
     if not isinstance(descriptor, classmethod):
         raise RuntimeError('FlyDSL MlirCompiler.compile API changed')
     original = cls.compile
-    if set(inspect.signature(original).parameters) != {'asm', 'func_name', 'config'}:
+    if set(inspect.signature(original).parameters) != {'module', 'arch', 'func_name', 'link_libs'}:
         raise RuntimeError('FlyDSL compile signature changed; adapt device_codegen.py first')
     state = {'compilations': 0}
 
-    def hooked(owner, asm, *, func_name, config):
-        if SYMBOL not in asm:
-            return original(asm, func_name=func_name, config=config)
+    def hooked(owner, module, *, arch='', func_name='', link_libs=None):
+        if SYMBOL not in module.operation.get_asm():
+            return original(module, arch=arch, func_name=func_name, link_libs=link_libs)
         state['compilations'] += 1
         if state['compilations'] != 1:
             raise RuntimeError('Unexpected repeated custom compilation')
-        module, report = compile_module(asm, config, symbol, llvm, out)
+        source, config = lowered_source(jf, module, arch, link_libs)
+        module, report = compile_module(source, config, symbol, llvm, out)
         state['report'] = report
         return module
 

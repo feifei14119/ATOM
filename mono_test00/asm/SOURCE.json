@@ -4,5 +4,5 @@
   "adapted_instructions": "identical to mono_test10 inline fragment; only enclosing function changed",
   "wrapping": "C++ standard ABI noinline+convergent function with fixed-input/clobber inline asm",
   "linking": "FlyDSL ffi + link_extern with real LLVM bitcode",
-  "validation": "Wrapper bitcode and offline assembly compiled; whole Mono and GPU tests NOT RUN"
+  "validation": "Whole Mono compiled and gfx1250 GPU A/B tests PASS (ROCm 7.16, AMD clang 23.0.0git)"
 }

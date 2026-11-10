@@ -76,6 +76,33 @@ def original_records():
     return records
 
 
+def round_trip_differences(records, assembled):
+    """Compare reassembled words per instruction; return tolerated differences.
+
+    Only one difference is accepted: a two-source VOP3 instruction whose unused
+    src2 field (second dword bits 26:18) the supplier toolchain encoded as 0 and
+    the current LLVM encodes as 0x80. The hardware does not read that field and
+    LLVM decodes both encodings to the same instruction.
+    """
+    assert len(assembled) == sum(4*len(ws) for _, _, ws in records)
+    tolerated, position = [], 0
+    for offset, inst, words in records:
+        expected = [int(w, 16) for w in words]
+        got = list(struct.unpack_from(f'<{len(words)}I', assembled, position))
+        position += 4*len(words)
+        if got == expected:
+            continue
+        operands = inst.split(None, 1)[1].split(',') if ' ' in inst else []
+        src2_mask = 0x1ff << 18
+        assert (len(words) == 2 and expected[0] >> 26 == 0b110101 and got[0] == expected[0]
+                and len(operands) == 3 and expected[1] & src2_mask == 0
+                and got[1] == expected[1] | 0x80 << 18), \
+            f'Reassembly differs at original +0x{offset:04x}: {inst}: {words} vs {got}'
+        tolerated.append({'offset': offset, 'instruction': inst, 'original': words,
+                          'reassembled': [f'{w:08X}' for w in got]})
+    return tolerated
+
+
 def rename_sgprs(inst):
     # A bijection to an unused range. Includes both ends of register tuples.
     def number(n):
@@ -171,8 +198,8 @@ mono_dq_convert_inline_fragment:
     original_co = output_dir/'dq_convert.original.co'
     run([llvm/'clang++', '--target=amdgcn-amd-amdhsa', '-mcpu=gfx1250',
          '-x', 'assembler', '-c', ROOT/'dq_convert.original.s', '-o', original_co])
-    original_bytes = b''.join(struct.pack('<I', int(w, 16)) for _, _, ws in records for w in ws)
-    assert Elf(original_co).body('_ZN5aiter29fmha_bwd_hd64_dq_convert_bf16E') == original_bytes
+    unused_src2 = round_trip_differences(
+        records, Elf(original_co).body('_ZN5aiter29fmha_bwd_hd64_dq_convert_bf16E'))
     co = output_dir/'dq_convert.inline.co'
     run([llvm/'clang++', '--target=amdgcn-amd-amdhsa', '-mcpu=gfx1250',
          '-x', 'assembler', '-c', ROOT/'dq_convert.inline.s', '-o', co])
@@ -205,6 +232,7 @@ mono_dq_convert_inline_fragment:
         'clobbers': [*[f's{i}' for i in SGPRS], *[f'v{i}' for i in VGPRS], 'scc', 'memory'],
         'sgpr_rename': {f's{i}': f's{i+10}' for i in range(30, 39)},
         'patches': manifest, 'removed_exit': 's_endpgm',
+        'reassembly_unused_src2': unused_src2,
         'minimum_vgprs': 46, 'minimum_numbered_sgprs': 49,
         'whole_function_register_caps': False, 'exec_entry_exit': 'full wave32',
         'mode_low8_inside': 192, 'mode_low8_restored': True,

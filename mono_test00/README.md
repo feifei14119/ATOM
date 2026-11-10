@@ -3,9 +3,10 @@
 本目录用与 `mono_test10` 相同的供应方 ASM、相同的 Mono 计算和 A/B 单测，验证
 **普通设备函数包装器 → `.bc` → FlyDSL `ffi + link_extern`** 的接入方式。
 
-当前状态：**已在本机离线生成包装器 `.bc`、提取用 ASM `.co/.inc` 和包装函数代码生成
-汇编，并通过相应 IR/源代码检查；没有编译整个 FlyDSL Mono，没有运行 GPU 单测。**
-本机没有完整目标 FlyDSL/AITER 环境，最终接入与数值正确性留待 gfx1250 机器验证。
+当前状态：**已在 gfx1250 上用 `./run.sh` 完整通过。** 环境为 ROCm 7.16
+（PyTorch `2.11.0+rocm10.1.0`）、AMD clang 23.0.0git（`d177931e65e6`）。9 组 native/FFI
+A/B 逐位一致，18 次融合 launch，1008 次 CTA 级 ASM 执行。更早的离线检查使用的是
+ROCm 7.2 / Clang 22；当前工具链需要的兼容处理见“工具链兼容性”。
 
 方案比较见 [ASM 接入方案文档](../mono_read/ASM_FLYDSL_MONO_INTEGRATION_OPTIONS.zh-CN.md)。
 
@@ -133,11 +134,12 @@ FlyDSL 传入 `uint64 + uint32`。包装器按标准设备 ABI 接收它们，�
 
 ## 本机离线编译观察
 
-ROCm 7.2 / Clang 22、gfx1250 下已生成并检查：
+ROCm 7.2 / Clang 22 和 ROCm 7.16 / Clang 23.0.0git、gfx1250 下均已生成并检查，
+下列观察值两者相同：
 
 - [dq_wrapper.bc](build/wrapper/dq_wrapper.bc)：只保留所需包装函数定义及 LLVM intrinsic 声明。
 - [dq_wrapper.ll](build/wrapper/dq_wrapper.ll)：普通 `void(i64, i32)`、noinline/convergent、
-  完整固定输入和 78 个 GPR clobber；opaque 字节与供应方片段一致。
+  完整固定输入和 78 个 GPR clobber；opaque 字节与当前汇编器生成的片段一致。
 - [dq_wrapper.codegen.s](build/wrapper/dq_wrapper.codegen.s)：编译器实际生成的 wrapper 汇编。
 
 本次包装器单独代码生成结果：
@@ -160,6 +162,42 @@ LLVM 再生成包含包装器的整个模块，最终数值与资源以 `build/f
 还发现本机 Clang 对 `noinline` 与 `noduplicate` 使用互斥的属性处理分支：同时写两者，
 会丢掉 noinline。因此实现使用 `noinline + convergent`，不通过修改 IR 添加 noinline。
 这由生成的 `.ll` 检查确认，避免包装器被意外展开到 Mono。
+
+## 工具链兼容性
+
+在 Clang 23.0.0git 上运行需要以下处理；这些处理不影响在 Clang 22 上的行为：
+
+- **未使用的 src2 编码。** 25 条双源 VOP3 指令（`v_and_b32_e64`、`v_mul_i32_i24_e64`、
+  `v_cmp_lt_u32_e64`、`v_cvt_pk_bf16_f32`）的第二个 dword 中，未使用的 src2 字段
+  （bit 26:18）在供应方二进制里为 `0`，Clang 23 编码为 `0x80`（内联常量 0）。
+  `llvm-mc` 把两种编码反汇编为同一条指令，硬件也不读取该字段。`prepare.py` 仍逐条比较
+  重汇编结果，只放行这一种差异，其余任何字节变化都报错；被放行的指令记录在
+  `build/asm/inline_contract.json` 的 `reassembly_unused_src2`。片段从当前汇编器生成，
+  因此其 SHA256 与 `VALIDATION.json` 里 Clang 22 的记录不同。
+- **反汇编越过符号末尾。** 新版 `llvm-objdump --disassemble-symbols` 会继续输出符号之后的
+  `s_code_end` / `s_nop 0` 对齐填充。`wrapper_audit.py` 按 ELF 符号大小截断，并断言
+  截掉的部分只有这两种填充。
+- **资源符号名。** 新版汇编中包装器资源写成 `.set .L<symbol>.num_vgpr` 等局部符号，
+  审计同时接受有无 `.L` 前缀的写法。
+- **`hip_runtime` 模块名冲突。** AITER 导入时会把 `aiter/jit/utils/` 插到 `sys.path` 最前，
+  其中的 `hip_runtime.py` 会遮蔽本目录同名文件。本目录的 HIP 辅助模块因此命名为
+  [mono_hip_runtime.py](mono_hip_runtime.py)。
+
+## gfx1250 运行结果
+
+`./run.sh` 在 gfx1250 设备 0 上通过：
+
+| 项目 | native | FFI |
+| --- | --- | --- |
+| VGPR / SGPR | 126 / 68 | 126 / 70 |
+| scratch | 0 | 32 字节/线程 |
+| spill | 无 | 无 |
+| LDS | 14848 字节 | 14848 字节 |
+| 驻留容量 | 4 CTA/CU，共 1024 ≥ 256 | 4 CTA/CU，共 1024 ≥ 256 |
+
+最终 ELF 中的 wrapper 为 1916 字节，片段位于偏移 192 处且只出现一次，Mono 本体中没有片段。
+zero/pattern/random 各三次：native 与 FFI 的所有中间结果及 QKV 逐位一致，112 个 ASM tile
+全部校验通过。
 
 ## 测试的计算范围
 
@@ -238,4 +276,4 @@ build/
 ```
 
 `build/wrapper/build.json` 的 `BUILT` 仅表示包装器离线构建通过。只有 `run.sh` 返回 0，
-并且 `build/result.json` 状态为 `PASS`，才表示 Mono 单测通过。当前还没有该运行结果。
+并且 `build/result.json` 状态为 `PASS`，才表示 Mono 单测通过。最近一次结果见“gfx1250 运行结果”。

@@ -89,7 +89,7 @@ def audit_codegen_envelope(text):
     _, after = rest.split(';;#ASMEND')
     result = {}
     for key in ('num_vgpr', 'numbered_sgpr', 'private_seg_size'):
-        match = re.search(r'\.set\s+'+WRAPPER+r'\.'+key+r',\s*(\d+)\b', text)
+        match = re.search(r'\.set\s+(?:\.L)?'+WRAPPER+r'\.'+key+r',\s*(\d+)\b', text)
         result[key] = int(match[1]) if match else None
     result['scratch_store_instructions_before'] = len(re.findall(r'^\s*scratch_store\w*\b', before, re.M))
     result['scratch_load_instructions_after'] = len(re.findall(r'^\s*scratch_load\w*\b', after, re.M))
@@ -125,7 +125,15 @@ def audit_linked_wrapper(kernel, symbol, resources, fragment_dir, llvm):
     caller_dis, wrapper_dis = disassemble(symbol), disassemble(WRAPPER)
     kernel.with_name('mono.function.disasm.txt').write_text(caller_dis)
     kernel.with_name('wrapper.function.disasm.txt').write_text(wrapper_dis)
-    caller_rows, wrapper_rows = disassembly_rows(caller_dis), disassembly_rows(wrapper_dis)
+    def symbol_rows(name, text):
+        # Newer llvm-objdump continues past the symbol size into alignment padding.
+        _, value, size, _ = obj.symbols[name]
+        rows = disassembly_rows(text)
+        inside = [row for row in rows if row[1] < value+size]
+        assert all(i in ('s_code_end', 's_nop 0') for i, _, _ in rows[len(inside):]), \
+            f'Non-padding instructions after {name}'
+        return inside
+    caller_rows, wrapper_rows = symbol_rows(symbol, caller_dis), symbol_rows(WRAPPER, wrapper_dis)
     assert caller_rows and wrapper_rows
     def bytes_of(rows):
         return b''.join(struct.pack('<I', int(w, 16)) for _, _, words in rows for w in words)

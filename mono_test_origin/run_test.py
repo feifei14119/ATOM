@@ -92,7 +92,7 @@ def compile_and_check(report, hip, stream, properties):
 
 def run_cases(args, report, hip, stream, launch, binary_sha):
     import torch
-    from hip_runtime import Buffer
+    from mono_hip_runtime import Buffer
     from reference import make_inputs, verify, exact, HIDDEN, HC, ROWS, MIX, SLICES
     from mono1250.kernels.reference_plan import C1ReferencePlan
     from mono1250.runtime.compile import _code_object
@@ -218,7 +218,8 @@ def main(args, report):
     import aiter
     if not hasattr(rocdl, "WMMAScale"):
         raise RuntimeError("FlyDSL lacks rocdl.WMMAScale; install the gfx1250-capable AITER/FlyDSL environment")
-    from hip_runtime import Hip
+    # Not hip_runtime: aiter puts aiter/jit/utils (with its own hip_runtime.py) first on sys.path.
+    from mono_hip_runtime import Hip
     report["modules"] = {"flydsl": flydsl.__file__, "aiter": aiter.__file__}
     hip = Hip()
     report["hip_library"] = hip.path

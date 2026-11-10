@@ -1,0 +1,250 @@
+"""Build the pinned inline fragment. --source-only never invokes a compiler.
+
+The source adapter is inherited from mono_read/mono_test1/atom. Runtime build
+products stay in mono_test10/build/asm; the original .s is never overwritten.
+"""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import struct
+import subprocess
+
+ROOT = Path(__file__).resolve().parent
+SOURCE_SHA = '4050f8e1eacf2463c98adeb8f2aeee2ca93e2792de3a43e58088cbd36a05a711'
+SYMBOL = 'mono_dq_convert_inline_fragment'
+SGPRS = [*range(2, 24), *range(25, 30), *range(40, 49)]
+VGPRS = list(range(4, 46))
+PATCHES = {
+    0x04: ('s_and_b32 s1, s1, 0xffff', ['s_nop 0', 's_nop 0']),
+    0x60: ('v_and_b32_e32 v0, 31, v0', ['s_nop 0']),
+    0x64: ('s_mov_b32 s2, ttmp9', ['s_mov_b32 s2, 0']),
+    0x68: ('s_and_b32 s3, ttmp7, 0xffff', ['s_mov_b32 s3, 0', 's_nop 0']),
+    0x70: ('s_bfe_u32 s4, ttmp7, 0x100010', ['s_mov_b32 s4, 0', 's_nop 0']),
+    0x78: ('s_bfe_u32 s24, ttmp8, 0x50019', ['s_nop 0', 's_nop 0']),
+}
+
+
+def run(command):
+    result = subprocess.run([str(x) for x in command], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(f'{command}\n{result.stdout}\n{result.stderr}')
+    if result.stderr:
+        print(result.stderr)
+    return result.stdout
+
+
+class Elf:
+    """Minimal ELF64 reader: exact sized symbol bytes, never objdump text as data."""
+    def __init__(self, path):
+        self.data = Path(path).read_bytes()
+        assert self.data[:6] == b'\x7fELF\x02\x01'
+        self.kind, self.machine = struct.unpack_from('<HH', self.data, 16)
+        offset = struct.unpack_from('<Q', self.data, 40)[0]
+        size, count = struct.unpack_from('<HH', self.data, 58)
+        self.sections = [struct.unpack_from('<IIQQQQIIQQ', self.data, offset+i*size)
+                         for i in range(count)]
+        self.symbols = {}
+        for sec in self.sections:
+            if sec[1] != 2:
+                continue
+            strings = self.sections[sec[6]]
+            text = self.data[strings[4]:strings[4]+strings[5]]
+            for at in range(sec[4], sec[4]+sec[5], sec[9]):
+                name, info, _, index, value, length = struct.unpack_from('<IBBHQQ', self.data, at)
+                name = text[name:text.index(b'\0', name)].decode()
+                if name:
+                    self.symbols[name] = index, value, length, info
+
+    def body(self, name):
+        index, value, length, _ = self.symbols[name]
+        sec = self.sections[index]
+        offset = sec[4]+value-sec[3]
+        return self.data[offset:offset+length]
+
+
+def original_records():
+    source = (ROOT / 'dq_convert.original.s').read_bytes()
+    assert hashlib.sha256(source).hexdigest() == SOURCE_SHA, 'Changed supplier: re-audit first'
+    records = []
+    for line in source.decode().splitlines():
+        m = re.fullmatch(r'(.*?) // original \+0x([0-9a-f]+): ([0-9A-F ]+)', line)
+        if m:
+            records.append((int(m[2], 16), m[1], m[3].split()))
+    assert len(records) == 292 and records[-1] == (0x5f4, 's_endpgm', ['BFB00000'])
+    return records
+
+
+def round_trip_differences(records, assembled):
+    """Compare reassembled words per instruction; return tolerated differences.
+
+    Only one difference is accepted: a two-source VOP3 instruction whose unused
+    src2 field (second dword bits 26:18) the supplier toolchain encoded as 0 and
+    the current LLVM encodes as 0x80. The hardware does not read that field and
+    LLVM decodes both encodings to the same instruction.
+    """
+    assert len(assembled) == sum(4*len(ws) for _, _, ws in records)
+    tolerated, position = [], 0
+    for offset, inst, words in records:
+        expected = [int(w, 16) for w in words]
+        got = list(struct.unpack_from(f'<{len(words)}I', assembled, position))
+        position += 4*len(words)
+        if got == expected:
+            continue
+        operands = inst.split(None, 1)[1].split(',') if ' ' in inst else []
+        src2_mask = 0x1ff << 18
+        assert (len(words) == 2 and expected[0] >> 26 == 0b110101 and got[0] == expected[0]
+                and len(operands) == 3 and expected[1] & src2_mask == 0
+                and got[1] == expected[1] | 0x80 << 18), \
+            f'Reassembly differs at original +0x{offset:04x}: {inst}: {words} vs {got}'
+        tolerated.append({'offset': offset, 'instruction': inst, 'original': words,
+                          'reassembled': [f'{w:08X}' for w in got]})
+    return tolerated
+
+
+def rename_sgprs(inst):
+    # A bijection to an unused range. Includes both ends of register tuples.
+    def number(n):
+        n = int(n)
+        return str(n+10 if 30 <= n <= 38 else n)
+    inst = re.sub(r'\bs\[(\d+):(\d+)\]',
+                  lambda m: 's['+number(m[1])+':'+number(m[2])+']', inst)
+    return re.sub(r'\bs(\d+)\b', lambda m: 's'+number(m[1]), inst)
+
+
+def disassembly_rows(text):
+    rows = []
+    for line in text.splitlines():
+        m = re.match(r'\s*(.*?)\s*//\s*([0-9A-Fa-f]+):\s*((?:[0-9A-Fa-f]{8}(?:\s+|$))+)', line)
+        if m:
+            rows.append((m[1].strip(), int(m[2], 16), m[3].split()))
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--llvm-bin', default='/opt/rocm/llvm/bin', type=Path)
+    ap.add_argument('--source-only', action='store_true')
+    ap.add_argument('--out-dir', type=Path, default=ROOT.parent/'build/asm')
+    args = ap.parse_args()
+    llvm = args.llvm_bin
+    records = original_records()
+    prefix = '''// Generated by prepare.py. gfx1250 wave32 INLINE fragment; no device-call ABI.
+// Inputs: s[0:1] = uniform global DqConvertArgs*, v0 = lane, s24 = wave in CTA.
+// Full EXEC on entry/exit. 128/256-thread 1D CTA, one complete 64x64 tile.
+// s30:s38 renamed to s40:s48; all modified GPRs declared in the inline header.
+// No kernel descriptor: this ET_REL symbol is extracted into the caller's .text.
+.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
+.amdhsa_code_object_version 6
+.text
+.globl mono_dq_convert_inline_fragment
+.hidden mono_dq_convert_inline_fragment
+.p2align 6
+.type mono_dq_convert_inline_fragment,@function
+mono_dq_convert_inline_fragment:
+    // Drain caller operations before overwriting the declared registers.
+    s_wait_loadcnt 0
+    s_wait_storecnt 0
+    s_wait_dscnt 0
+    s_wait_kmcnt 0
+    s_wait_xcnt 0
+    s_waitcnt_depctr 0
+    s_cmp_ge_u32 s24, 4
+    s_cbranch_scc1 .Linline_end
+    // Only floating-point MODE bits, never the gfx1250 VGPR bank bits.
+    s_getreg_b32 s5, hwreg(HW_REG_MODE, 0, 8)
+    s_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 8), 0xc0
+    s_nop 7
+.Linline_payload:
+'''
+    lines, manifest = [], []
+    for offset, inst, words in records[:-1]:
+        if offset in PATCHES:
+            old, replacement = PATCHES[offset]
+            assert inst == old and len(replacement) == len(words)
+            lines.append(f'    // Replaced original +0x{offset:04x}: {inst}')
+            lines.extend('    '+op for op in replacement)
+            manifest.append({'offset': offset, 'original': inst, 'replacement': replacement})
+        else:
+            new = rename_sgprs(inst)
+            lines.append(f'    {new} // original +0x{offset:04x}'
+                         + (f'; renamed from: {inst}' if new != inst else ''))
+    suffix = '''
+.Linline_payload_end:
+    // s_endpgm removed. Complete writes and restore the caller's FP mode.
+    s_wait_loadcnt 0
+    s_wait_storecnt 0
+    s_wait_dscnt 0
+    s_wait_kmcnt 0
+    s_wait_xcnt 0
+    s_waitcnt_depctr 0
+    s_setreg_b32 hwreg(HW_REG_MODE, 0, 8), s5
+    s_nop 7
+.Linline_end:
+    // Fall through into the next instruction of the enclosing Mono kernel.
+.size mono_dq_convert_inline_fragment, .Linline_end-mono_dq_convert_inline_fragment
+.section .note.GNU-stack,"",@progbits
+'''
+    source = prefix+'\n'.join(lines)+'\n'+suffix
+    if args.source_only:
+        (ROOT/'dq_convert.inline.s').write_text(source)
+        print('Wrote modified assembly source only; no compilation or GPU execution.')
+        return
+    assert (ROOT/'dq_convert.inline.s').read_text() == source, 'Source changed: update adapter and clobber audit together'
+    output_dir = args.out_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Check the original assembly round trip on the target toolchain as well.
+    original_co = output_dir/'dq_convert.original.co'
+    run([llvm/'clang++', '--target=amdgcn-amd-amdhsa', '-mcpu=gfx1250',
+         '-x', 'assembler', '-c', ROOT/'dq_convert.original.s', '-o', original_co])
+    unused_src2 = round_trip_differences(
+        records, Elf(original_co).body('_ZN5aiter29fmha_bwd_hd64_dq_convert_bf16E'))
+    co = output_dir/'dq_convert.inline.co'
+    run([llvm/'clang++', '--target=amdgcn-amd-amdhsa', '-mcpu=gfx1250',
+         '-x', 'assembler', '-c', ROOT/'dq_convert.inline.s', '-o', co])
+    elf = Elf(co)
+    assert (elf.kind, elf.machine) == (1, 224)
+    assert not any(s[1] in (4, 9) and s[5] for s in elf.sections), 'Unresolved relocation'
+    assert not [n for n, s in elf.symbols.items() if s[0] == 0 or n.endswith('.kd')]
+    body = elf.body(SYMBOL)
+    dis = run([llvm/'llvm-objdump', '--mcpu=gfx1250', '--disassemble-symbols='+SYMBOL, co])
+    rows = disassembly_rows(dis)
+    assert b''.join(struct.pack('<I', int(w, 16)) for _, _, ws in rows for w in ws) == body
+    assert not any(re.search(r'\bs_(?:endpgm|getpc|setpc|swappc|swap_pc)', i) for i, _, _ in rows)
+    branches = [(i, a, ws) for i, a, ws in rows if i.startswith('s_cbranch')]
+    assert len(branches) == 1 and branches[0][0].startswith('s_cbranch_scc1')
+    _, address, words = branches[0]
+    assert address + 4 + 4*(int(words[0], 16) & 0xffff) == len(body)
+    output = ['// Generated from dq_convert.inline.co. Do not edit instruction words manually.']
+    for inst, _, words in rows:
+        output.append(json.dumps('.long '+', '.join('0x'+w.lower() for w in words)+'\n')+' // '+inst)
+    (output_dir/'dq_convert.inline.words.inc').write_text('\n'.join(output)+'\n')
+    (output_dir/'dq_convert.inline.disasm.txt').write_text(dis)
+    (output_dir/'dq_convert.inline.bin').write_bytes(body)
+    contract = {
+        'target': 'gfx1250', 'wave_size': 32, 'block_threads': [128, 256],
+        'symbol': SYMBOL, 'elf_type': 'ET_REL; extraction artifact, not launchable/callable',
+        'source_sha256': SOURCE_SHA, 'fragment_bytes': len(body),
+        'fragment_sha256': hashlib.sha256(body).hexdigest(),
+        'fixed_inputs': {'s[0:1]': 'uniform GPU global args pointer', 'v0': 'lane 0..31',
+                         's24': 'wave in physical CTA'},
+        'clobbers': [*[f's{i}' for i in SGPRS], *[f'v{i}' for i in VGPRS], 'scc', 'memory'],
+        'sgpr_rename': {f's{i}': f's{i+10}' for i in range(30, 39)},
+        'patches': manifest, 'removed_exit': 's_endpgm',
+        'reassembly_unused_src2': unused_src2,
+        'minimum_vgprs': 46, 'minimum_numbered_sgprs': 49,
+        'whole_function_register_caps': False, 'exec_entry_exit': 'full wave32',
+        'mode_low8_inside': 192, 'mode_low8_restored': True,
+        'lds_bytes': 0, 'private_bytes_in_fragment': 0,
+        'virtual_grid': [0, 0, 0], 'tile': [64, 64],
+        'gpu_validation': 'not run: no gfx1250 GPU locally',
+    }
+    contract['assembly_sha256'] = hashlib.sha256(source.encode()).hexdigest()
+    contract['constraints'] = ','.join(['{s[0:1]}', '{v0}', '{s24}'] + ['~{'+r+'}' for r in contract['clobbers']])
+    (output_dir/'inline_contract.json').write_text(json.dumps(contract, indent=2)+'\n')
+    print(f'Generated .s, .co and inline .long words: {len(body)} bytes, gfx1250 wave32')
+
+
+if __name__ == '__main__':
+    main()

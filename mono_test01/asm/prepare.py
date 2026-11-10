@@ -34,6 +34,43 @@ def original_records():
     return records
 
 
+def round_trip_differences(records, assembled):
+    """Compare reassembled words per instruction; return tolerated differences.
+
+    Only one difference is accepted: a two-source VOP3 instruction whose unused
+    src2 field (second dword bits 26:18) the supplier toolchain encoded as 0 and
+    the current LLVM encodes as 0x80. The hardware does not read that field and
+    LLVM decodes both encodings to the same instruction.
+    """
+    assert len(assembled) == sum(4*len(ws) for _, _, ws in records)
+    tolerated, position = [], 0
+    for offset, inst, words in records:
+        expected = [int(w, 16) for w in words]
+        got = list(struct.unpack_from(f'<{len(words)}I', assembled, position))
+        position += 4*len(words)
+        if got == expected:
+            continue
+        operands = inst.split(None, 1)[1].split(',') if ' ' in inst else []
+        src2_mask = 0x1ff << 18
+        assert (len(words) == 2 and expected[0] >> 26 == 0b110101 and got[0] == expected[0]
+                and len(operands) == 3 and expected[1] & src2_mask == 0
+                and got[1] == expected[1] | 0x80 << 18), \
+            f'Reassembly differs at original +0x{offset:04x}: {inst}: {words} vs {got}'
+        tolerated.append({'offset': offset, 'instruction': inst, 'original': words,
+                          'reassembled': [f'{w:08X}' for w in got]})
+    return tolerated
+
+
+def symbol_rows(text, obj, symbol):
+    # Newer llvm-objdump continues past the symbol size into alignment padding.
+    _, value, size, _ = obj.symbols[symbol]
+    rows = disassembly_rows(text)
+    inside = [row for row in rows if row[1] < value+size]
+    assert all(i in ('s_code_end', 's_nop 0') for i, _, _ in rows[len(inside):]), \
+        f'Non-padding instructions after {symbol}'
+    return inside
+
+
 def disassembly_rows(text):
     rows = []
     for line in text.splitlines():
@@ -153,9 +190,9 @@ def main():
         run([llvm/'clang++', '--target=amdgcn-amd-amdhsa', '-mcpu=gfx1250',
              '-x', 'assembler', '-c', ROOT/f'dq_convert.{kind}.s', '-o', out/f'dq_convert.{kind}.co'])
     original = Elf(out/'dq_convert.original.co').blob('_ZN5aiter29fmha_bwd_hd64_dq_convert_bf16E')
-    expected = b''.join(struct.pack('<I', int(w, 16)) for _, _, words in original_records() for w in words)
-    assert original == expected, 'Original assembly no longer reproduces supplier instructions'
+    unused_src2 = round_trip_differences(original_records(), original)
     report = audit_object(out/'dq_convert.lowctx.co', llvm)
+    report['reassembly_unused_src2'] = unused_src2
     (out/'resources.json').write_text(json.dumps(report, indent=2)+'\n')
     print('Built independent low-context device .co; no .inc or .long extraction')
 

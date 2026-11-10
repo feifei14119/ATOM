@@ -4,9 +4,9 @@
 **ASM 独立汇编成 `.co`，调用方生成真实设备函数 call，在寄存器分配前缩小该调用点的
 call-preserved regmask，然后链接为一个可启动的 Mono `.co`。**
 
-当前状态：**已生成原始/适配 ASM、接入代码和一键脚本，仅做源码静态检查；没有编译，
-没有运行 CPU 数值单测或 GPU 单测。** 先前单测同样尚未经过 gfx1250 真机验证。
-运行结果以目标机器的 `build/result.json` 和退出码为准。
+当前状态：**已在 gfx1250 上用 `./run.sh` 完整通过。** 环境为 ROCm 7.16、
+AMD clang 23.0.0git（`d177931e65e6`）、FlyDSL 0.4.1。9 组 native/lowctx A/B 逐位一致，
+18 次融合 launch，1008 次 CTA 级 ASM 调用。结果见“gfx1250 运行结果”。
 
 ## 一键运行
 
@@ -24,20 +24,31 @@ cd /home/feifei/repo/ATOM/mono_test01
 PYTHON=/path/to/python MONO_TEST_TIMEOUT_SECONDS=1800 ./run.sh
 ```
 
-本原型沿用 `callee_test01` 的工具链约束：ROCm LLVM 提交
-`7b800a19466229b8479a78de19143dc33c3ab9b5`，需要 `clang++`、`llc`、`opt`、
-`llvm-dis`、`ld.lld`、`llvm-objdump`。从所选 `llc` 的 ELF 符号表读取寄存器表，
-因此 stripped/不同布局的工具也会被拒绝。不能只换一个 LLVM 版本并跳过检查。
-另需 FlyDSL 提供以下接口：
+工具链固定为 ROCm LLVM 提交 `d177931e65e6057dca59f1c5b95e643d29876db3`（`callee_test01`
+原先固定的是 `7b800a19`）。需要 `clang++`、`llc`、`opt`、`llvm-dis`、`ld.lld`、
+`llvm-objdump`。寄存器表从所选 `llc` 的 ELF 符号表读取，因此 stripped 或布局不同的
+工具会被拒绝。换 LLVM 版本时必须同时更新 `callsite_regmask.py` 的 `LLVM_COMMIT`，
+并让下文的 MIR 往返检查重新通过，不能跳过检查。
 
-- `flydsl.compiler.jit_function.MlirCompiler.compile(asm, *, func_name, config)`；
+**`llc` 的来源。** ROCm 7.16 的 Python wheel 不带 `llc`。所选 LLVM 目录缺少 `llc` 时，
+[build_llc.py](build_llc.py) 会用 [tools/llc](tools/llc) 中同一提交的 `llvm/tools/llc`
+源码（未修改，SHA256 记录在 `SOURCE.json`），静态链接到 ROCm devel 包
+（`_rocm_sdk_devel/lib/llvm`）的头文件和静态库，生成 `build/llvm-bin/llc`。约 10 秒，
+按源码和工具链摘要缓存。其余工具以符号链接指向原安装。构建前要求头文件
+`VCSRevision.h`、`clang++ --version` 和 `SOURCE.json` 的提交号三者一致。
+脚本不下载、安装或改写系统编译器，也不需要外部 `mlir-opt/mlir-translate`。
+
+另需 FlyDSL（已验证 0.4.1）提供以下接口：
+
+- `flydsl.compiler.jit_function.MlirCompiler.compile(module, *, arch, func_name, link_libs)`，
+  以及其内部使用的 `get_backend`、`CompilationContext.get_compile_hints`、
+  `lower_compile_hints` 和 `_pipeline_fragments_for_mode`；
 - `CompilationContext.get_current()` 和 `gpu_module_body`；
 - 内置 ROCDL serializer 的 `gpu-module-to-binary{format=llvm}`；
 - 配套 MLIR Python bindings、LLVM dialect 和 `llvm.call` 的 `convergent` 属性。
 
-本地 codegen hook 按这些接口编写，并在运行时检查。不兼容会报告错误，不会退回普通
-regmask。**该 gfx1250 + FlyDSL 组合尚未实机验证；工具链兼容性是待验证项。**
-脚本不下载、安装或改写系统编译器。它不需要外部 `mlir-opt/mlir-translate`。
+本地 codegen hook 按这些接口编写，并在运行时检查签名。不兼容会报告错误，不会退回普通
+regmask。hook 按 `compile` 的原有步骤准备 module 和 pass 流水线，只替换最后的机器码生成。
 
 ## 替换的步骤
 
@@ -78,11 +89,11 @@ projection(...)                            projection_asm.py
                  ↓ callsite_regmask.py（寄存器分配之前）
                SI_CALL ..., @mono_dq_convert_lowctx, CustomRegMask(...), ...
                  ↓ LLVM 分配寄存器、处理 spill、生成指令
-               s_swappc_b64 s[30:31], ...
+               s_swappc_b64 s[30:31], ...       （gfx1250 反汇编为 s_swap_pc_i64）
                  ↓ 独立汇编函数
                mono_dq_convert_lowctx:
                  ... 参数桥接、ASM 转换 ...
-                 s_setpc_b64 s[30:31]
+                 s_setpc_b64 s[30:31]           （gfx1250 反汇编为 s_set_pc_i64）
 ```
 
 `dq_device.py` 在 GPU module 中建立外部 `llvm.func` 声明，并发出真实 `llvm.call`。
@@ -149,6 +160,22 @@ LLVM 可以产生搬运、重算和 scratch spill/reload，不承诺零 scratch�
 不复制默认流水线的 VGPR/SGPR/private 计数。任一步往返不一致都会报错。
 生产集成更适合在 LLVM 编译进程内实现 pre-RA regmask pass，避免 MIR 序列化。
 
+### 当前工具链的兼容处理
+
+- **MIR 中的 `$vcc_lo`。** wave32 MIR 打印器给 `S_CBRANCH_VCC(N)Z` 和
+  `V_DIV_FMAS_F32/F64_e64` 写出 `implicit $vcc_lo`，解析器却要求指令描述中的
+  `implicit $vcc`。读回前在 `$vcc_lo` 后补 `implicit undef $vcc`（本次 Mono 中共 32 处：
+  8 条分支、24 条 `V_DIV_FMAS_F32`）。undef 使用不产生活跃性；未改掩码的往返仍须与
+  默认流水线逐字节一致，这一检查已通过。
+- **未使用的 src2 编码。** 原始 ASM 重汇编时，25 条双源 VOP3 指令未使用的 src2 字段
+  （第二个 dword bit 26:18）由供应方的 `0` 变为 Clang 23 的 `0x80`。`prepare.py` 逐条比较，
+  只放行这一种差异，记录在 `build/asm/resources.json` 的 `reassembly_unused_src2`。
+- **反汇编名称与范围。** gfx1250 反汇编使用 `s_swap_pc_i64` / `s_set_pc_i64`，审计接受新旧
+  两种拼写。新版 `llvm-objdump --disassemble-symbols` 会继续输出符号后的
+  `s_code_end` / `s_nop 0` 填充，审计按 ELF 符号大小截断，并断言截掉的只有填充。
+- **`hip_runtime` 模块名冲突。** AITER 导入时会把 `aiter/jit/utils/` 插到 `sys.path` 最前，
+  其中的同名文件会遮蔽本目录的 HIP 辅助模块，因此改名为 [mono_hip_runtime.py](mono_hip_runtime.py)。
+
 ## 运行时验证
 
 默认 zero/pattern/random 各三次，共 **9 组 A/B、18 次融合 launch、1008 次 CTA 级 ASM 调用**。
@@ -162,7 +189,28 @@ LLVM 可以产生搬运、重算和 scratch spill/reload，不承诺零 scratch�
 
 寄存器侧使用所选 LLVM 的 machine verifier、pre/post-RA regmask 检查和供应方写集合
 检查。**没有把 `callee_test01` 只适用于单基本块的 liveness 检查器套到 Mono 的复杂 CFG，
-也没有宣称已获得所有真实活跃物理寄存器的独立报告。** 最终数值和上下文恢复需真机验证。
+也没有宣称已获得所有真实活跃物理寄存器的独立报告。** 跨调用上下文的正确性由下面的
+GPU A/B 测试验证。
+
+## gfx1250 运行结果
+
+`./run.sh` 在 gfx1250 设备 0 上通过：
+
+| 项目 | native | lowctx |
+| --- | --- | --- |
+| VGPR / SGPR | 126 / 68 | 257 / 108 |
+| spill（VGPR / SGPR） | 0 / 0 | 1 / 16 |
+| scratch | 0 | 16 字节/线程 |
+| LDS | 14848 字节 | 14848 字节 |
+| 驻留容量 | 4 CTA/CU，共 1024 ≥ 256 | 1 CTA/CU，共 256 = 256 |
+
+缩小 regmask 后，跨调用上下文只能放在 v40～v47、v56～v63、s30～s39 中，其余活跃值由
+LLVM 搬运或 spill，因此 lowctx 的资源高于 native。这符合上文“不承诺零 scratch”的预期。
+驻留容量刚好等于 256 个 CTA，没有余量；调用方再增加寄存器压力就可能无法全部驻留。
+
+zero/pattern/random 各三次：native 与 lowctx 的所有中间结果及 QKV 逐位一致，112 个 ASM tile
+全部校验通过。目标 `SI_CALL` 改用的 `CustomRegMask` 经寄存器分配后仍然保留
+（保留 177 个、删除 779 个掩码项）。
 
 ## 文件与产物
 
@@ -173,6 +221,7 @@ LLVM 可以产生搬运、重算和 scratch spill/reload，不承诺零 scratch�
 | [dq_device.py](mono1250/kernels/dq_device.py) | 外部函数声明与真实 LLVM call |
 | [device_codegen.py](device_codegen.py) | 本进程内的 FlyDSL 编译接入 |
 | [callsite_regmask.py](callsite_regmask.py)、[regmask_tables.py](regmask_tables.py) | pre-RA 修改、别名筛选、往返检查和链接 |
+| [build_llc.py](build_llc.py)、[tools/llc](tools/llc) | 所选 LLVM 缺少 `llc` 时，用同一提交的源码构建 |
 | [dq_convert.original.s](asm/dq_convert.original.s) | 原始 ASM，原样保留 |
 | [dq_convert.lowctx.s](asm/dq_convert.lowctx.s) | 重命名寄存器并适配设备 ABI 的 ASM |
 | [prepare.py](asm/prepare.py)、[audit.py](asm/audit.py) | 可复现改写、汇编与接口核对 |
@@ -183,6 +232,8 @@ LLVM 可以产生搬运、重算和 scratch spill/reload，不承诺零 scratch�
 ```text
 build/
   run.log / result.json
+  llvm-bin/                                # 仅在所选 LLVM 缺少 llc 时生成
+    llc / stamp.json / 指向原安装工具的符号链接
   asm/
     dq_convert.original.co
     dq_convert.lowctx.co / dq_convert.lowctx.disasm.txt / resources.json

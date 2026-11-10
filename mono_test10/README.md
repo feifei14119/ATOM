@@ -2,7 +2,7 @@
 
 本目录复制自 `../mono_test_origin`，保留原始 Mono 作为 A/B 基线，同时增加一条真正嵌入 ASM 的 Mono 路径。外层 ATOM、`mono_test_origin`、`callee_test10` 和 `mono_read` 均不需要修改。
 
-**当前状态：已编写并做静态检查，尚未编译、运行单测或进行 gfx1250 真机验证。** 已生成并保留原始/修改后的 `.s`；`.co`、`.inc` 和最终 Mono 二进制会在目标机器运行脚本时构建。原单测本身也尚未经过真机验证，A/B 的两条路径都会先接受资源检查和 CPU 数值校验。
+**当前状态：已在 gfx1250 上用 `./run.sh` 完整通过。** 环境为 ROCm 7.16、AMD clang 23.0.0git（`d177931e65e6`）、FlyDSL 0.4.1。9 组 native/inline A/B 逐位一致，18 次融合 launch，1008 次 CTA 级 ASM 执行。结果和当前工具链所需的兼容处理见“gfx1250 运行结果”。已生成并保留原始/修改后的 `.s`；`.co`、`.inc` 和最终 Mono 二进制在运行脚本时构建。
 
 ## 一键运行
 
@@ -119,7 +119,7 @@ asm/dq_convert.original.s
 在启动 GPU 前：
 
 1. 原始 `.s` 的摘要和改写清单、真实写寄存器集合、固定输入只读、EXEC/MODE 恢复。
-2. 原始 `.s` 重汇编与注释机器码一致；适配 `.co` 无重定位；`.inc` 与完整符号的机器码逐字节一致。
+2. 原始 `.s` 重汇编与注释机器码逐条一致，唯一放行的差异是双源 VOP3 指令中未使用的 src2 字段（见“gfx1250 运行结果”）；适配 `.co` 无重定位；`.inc` 与完整符号的机器码逐字节一致。
 3. native/inline 两个 Mono 都是 wave32，实际驻留容量均至少覆盖 256 CTA。
 4. inline Mono 的目标函数中恰好存在一份完整片段，保持 64 字节对齐，资源描述覆盖片段使用的最高 VGPR/SGPR。
 
@@ -155,6 +155,24 @@ build/
   cache/
 ```
 
-`result.json` 记录两条路径的源码/二进制指纹、软件环境、资源、A/B 结果及 ASM tile 校验。只有本次脚本退出码为 0、最后打印 `[PASS]` 且报告状态为 `PASS` 才表示通过；本文没有宣称这些运行检查已经通过。
+`result.json` 记录两条路径的源码/二进制指纹、软件环境、资源、A/B 结果及 ASM tile 校验。只有本次脚本退出码为 0、最后打印 `[PASS]` 且报告状态为 `PASS` 才表示通过；最近一次结果见下节。
+
+## gfx1250 运行结果
+
+`./run.sh` 在 gfx1250 设备 0 上通过：
+
+| 项目 | native | inline |
+| --- | --- | --- |
+| VGPR / SGPR | 126 / 68 | 126 / 68 |
+| scratch / spill | 0 / 无 | 0 / 无 |
+| LDS | 14848 字节 | 14848 字节 |
+| 驻留容量 | 4 CTA/CU，共 1024 ≥ 256 | 4 CTA/CU，共 1024 ≥ 256 |
+
+zero/pattern/random 各三次：native 与 inline 的所有中间结果及 QKV 逐位一致，112 个 ASM tile 全部校验通过。
+
+在当前工具链上需要两处兼容处理：
+
+- **未使用的 src2 编码。** 原始 ASM 重汇编时，25 条双源 VOP3 指令（`v_and_b32_e64`、`v_mul_i32_i24_e64`、`v_cmp_lt_u32_e64`、`v_cvt_pk_bf16_f32`）的第二个 dword 中，未使用的 src2 字段（bit 26:18）由供应方的 `0` 变为 Clang 23 的 `0x80`（内联常量 0）。`llvm-mc` 把两种编码反汇编为同一条指令，硬件也不读取该字段。`prepare.py` 逐条比较，只放行这一种差异，记录在 `build/asm/inline_contract.json` 的 `reassembly_unused_src2`。嵌入 Mono 的 `.inc` 来自当前汇编器的输出。
+- **`hip_runtime` 模块名冲突。** AITER 导入时会把 `aiter/jit/utils/` 插到 `sys.path` 最前，其中的同名文件会遮蔽本目录的 HIP 辅助模块，因此改名为 [mono_hip_runtime.py](mono_hip_runtime.py)。
 
 `asm/prepare.py --source-only` 只重新生成修改后的 `.s`，不会编译。正常 `run.sh` 会检查 `.s` 与生成器一致再构建；修改供应方或改写规则时必须同步复核寄存器和状态契约。复制保留的 C++ `.h` 仅作接口对照，实际 FlyDSL kernel 使用 `dq_inline.py`，不会 `#include` C++ header。

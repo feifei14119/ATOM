@@ -1,0 +1,1588 @@
+diff --git a/llvm/docs/AMDGPUAsmStrictPolicies.rst b/llvm/docs/AMDGPUAsmStrictPolicies.rst
+new file mode 100644
+index 000000000000..6811e0bf2085
+--- /dev/null
++++ b/llvm/docs/AMDGPUAsmStrictPolicies.rst
+@@ -0,0 +1,81 @@
++===========================================
++AMDGPU strict register and private policies
++===========================================
++
++The experimental string function attributes ``"amdgpu-no-gpr-spill"`` and
++``"amdgpu-no-private-memory"`` request fail-closed validation of the generated
++machine code. They are intended for Mono kernels calling external assembly
++through the versioned AMDGPU ASM call contract. The attributes are opt-in and
++do not change ordinary AMDGPU code generation when absent.
++
++Semantics
++=========
++
++``amdgpu-no-gpr-spill`` rejects lowered SGPR/VGPR spill operations, SGPR
++callee-saved spills into VGPR lanes, callee-saved memory saves, and whole-wave
++register spills. Copies to unused SGPRs remain permitted. The test uses the
++backend's spill provenance and frame-lowering records, not an instruction-name
++search: an algorithm's ordinary lane operation is not intrinsically a spill.
++
++``amdgpu-no-private-memory`` rejects private frames, incoming stack arguments,
++dynamic stack or dynamic-VGPR scratch reservations, and instructions that may
++access private memory. It includes default-ABI save frames, not only spill
++statistics. A private-address-space load is rejected even if the function has
++no stack frame. An unresolved generic address that may address private memory
++is conservatively rejected.
++
++Both policies propagate from an annotated function to its transitive direct
++callees in the compilation module. Unknown external callees, indirect calls
++and recursion are rejected. External declarations must have a supported ASM
++call contract with zero private memory. Their machine code is not present in
++the IR module: a separate object auditor and identity check are still required
++before linking or publishing the executable. These attributes do not prove a
++supplier's declaration truthful.
++
++Nonempty inline assembly and module-level assembly are rejected under either
++policy because the generated instruction stream is opaque to this validator.
++An empty inline asm with register constraints/clobbers is permitted. This is an
++intentional conservative limitation; it must not be worked around by asserting
++that all unknown assembly has zero private memory.
++
++Checks run at the assembly-printer boundary, after allocation, frame lowering,
++and register scavenging. The current implementation tries normal allocation
++and rejects disallowed results; it does not provide a different register
++allocator or promise to find every possible spill-free assignment. A strict
++success guarantees the checked properties subject to external contracts,
++while a failure may be an allocation limitation rather than a mathematical
++impossibility. Lowered spill counters can conservatively record spills that a
++later pass removed. Such cases may be rejected rather than silently accepted.
++
++These attributes do not permit the compiler to introduce hidden LDS/global
++context saves. No such fallback is added by this implementation. Normal
++algorithmic memory accesses remain legal when their address space excludes
++private memory.
++
++Machine-readable report
++=======================
++
++Use ``-amdgpu-asm-contract-report=/path/to/report.json`` with ``llc``. The
++parent directory must exist. The report is emitted for either assembly or
++object output, with schema ``amdgpu.asm_contract_report.v1``. The top-level
++``strict_policy_status`` is ``checked``, ``rejected`` or ``not_requested``;
++``external_object_audit_required`` explicitly remains true.
++
++Each compiled function records inherited policies, lowered spill dword counts,
++SGPR ABI lane saves, ABI memory saves, whole-wave spill register counts,
++private frame and incoming stack-argument bytes, dynamic stack status,
++potential private accesses, and analyzed numbered GPR extents.
++
++Each machine call records its target, fixed-register contract attributes,
++allocatable GPRs preserved by the actual call instruction, and physical GPRs
++live through that instruction. The latter is computed by backward physical
++liveness and excludes call definitions and regmask clobbers. It describes the
++point *after argument preparation*, not the entire argument-copy/call/result
++sequence. It does not claim to reconstruct source-level variable identities.
++The full-wave precondition is labeled ``caller_asserted``; the current backend
++does not prove arbitrary CTA/wave participation.
++
++A report with ``checked`` is a compiler-side policy result, not proof that a
++subsequently linked external object matches the declared contract. A driver
++must also check successful compilation, the final linked executable, object
++hashes, and any execution-state preconditions before treating it as verified.
+diff --git a/llvm/docs/AMDGPUExternalAsmContract.rst b/llvm/docs/AMDGPUExternalAsmContract.rst
+new file mode 100644
+index 000000000000..965206bf5697
+--- /dev/null
++++ b/llvm/docs/AMDGPUExternalAsmContract.rst
+@@ -0,0 +1,145 @@
++AMDGPU external assembly call contract (experimental)
++====================================================
++
++This prototype provides a target-specific ABI for calls to external assembly
++leaf functions. It is intended for a fused AMDHSA kernel whose generated code
++must keep live values across an assembly operator. It uses ordinary LLVM calls
++with a versioned set of target attributes. SelectionDAG lowers the complete
++contract before register allocation; no MIR editing is involved.
++
++This is an experimental interface in this branch, not an upstream-supported
++ABI. An unmodified LLVM may ignore these string attributes. A producer must
++select a compatible toolchain and verify support, for example by checking that
++a call with an unsupported contract version is rejected.
++
++Version 1 scope
++---------------
++
++* AMDHSA, gfx1250, wave32, SelectionDAG (``-global-isel=0``).
++* A direct, non-tail call to an external declaration with ``ccc``. The
++  declaration must be ``convergent nounwind norecurse``.
++* The symbol denotes an assembly leaf function supplied at object-link time.
++  IR definitions, address escapes, aliases, signature casts, varargs and
++  implicit aggregate/stack arguments are rejected.
++* Arguments and results are 32/64-bit integers or 64-bit pointers. All argument
++  passing is explicit; the default device ABI's hidden workitem, workgroup,
++  kernarg and scratch arguments are not forwarded.
++* Return PC is in s[30:31]. The callee leaves s[30:39] unchanged, returns to that
++  PC, uses no private memory or LDS, makes no further calls, and does not end
++  the wave with ``s_endpgm``.
++* Entry and exit have full EXEC. All execution state, including MODE and VGPR
++  addressing MSBs, is preserved except declared SCC/VCC clobbers. Normal
++  gfx1250 call lowering resets addressing MSBs to zero before a call. A supplier
++  using high VGPR encodings must restore the MSBs before returning.
++* Dynamic VGPR allocation mode is not supported.
++* The supplier must complete pending memory/async operations before returning;
++  the normal AMDGPU call wait insertion handles caller operations at entry.
++  A memory-effect declaration alone is not a hardware fence or CTA barrier.
++
++Full EXEC is a caller precondition, not a consequence of ``convergent``. The
++caller must explicitly set ``"amdgpu-asm-full-wave-calls"="true"``. The backend
++also rejects calls under a statically identified divergent dominating branch
++that has not reconverged. This check is not a proof of arbitrary collective
++control flow: the producer remains responsible for the full-wave assertion,
++and for any required CTA-wide participation.
++
++Attributes
++----------
++
++``amdgpu-asm-contract``
++  Required version string, currently ``"1"``.
++
++``amdgpu-asm-arg-regs``
++  Required comma-separated input bindings in source argument order. Examples:
++  ``s0,s1,v[0:1],v2,v3,s2``. Empty for no parameters. A range is inclusive;
++  the lower-numbered register contains the low dword. A 64-bit pair must start
++  at an even register. Overlapping argument bindings are rejected.
++
++``amdgpu-asm-result-reg``
++  Required for non-void results, e.g. ``v4``, ``s4`` or ``v[8:9]``. A result
++  always clobbers its physical registers. It may reuse an input location.
++
++``amdgpu-asm-clobbers``
++  Required complete net-clobber list. Examples: ``s[4:7],v[4:15],v64,scc,vcc``.
++  Empty means no additional clobbers. All unlisted GPRs are preserved. The
++  backend clears every overlapping sub/superregister in its custom regmask.
++  The argument copies, call-target temporaries and return-PC definition remain
++  explicit machine operands, so their effects are included in liveness.
++
++``amdgpu-asm-vgpr-count`` / ``amdgpu-asm-sgpr-count``
++  Required decimal physical-register extents. They cover every input, output
++  and clobbered GPR and any internal temporary. SGPR extent is at least 32 to
++  cover the return-PC pair. These are numbered-register extents, not final HSA
++  metadata counts, and are merged into caller resource analysis. For example,
++  a callee using v95 requires a VGPR extent of at least 96 even if it uses only
++  a few individual registers.
++
++The declared extents are checked against the caller's target/workgroup and
++explicit allocation budget before register allocation. Their contribution to
++the final kernel resource count is merged during resource analysis. This
++prototype does not yet feed the callee's resource floor into every scheduler
++occupancy heuristic.
++
++``amdgpu-asm-private-bytes``
++  Required and must be ``"0"`` in version 1. This describes the assembly
++  supplier, not the compiler-generated caller's scratch requirements.
++
++Values passed to SGPRs must be known uniform by SelectionDAG's divergence
++analysis. Divergent values are rejected; the ABI does not implicitly discard
++other lanes through ``readfirstlane``. Fixed bindings do not guarantee absence
++of moves. Coalescing can eliminate a copy when source and destination already
++match, but otherwise normal register copies may be needed.
++
++Example
++-------
++
++.. code-block:: llvm
++
++  declare i32 @stage(i32, i32, i64, i32, i32, i32) #1
++
++  define amdgpu_kernel void @mono(ptr addrspace(1) %out) #0 {
++    %bx = call i32 @llvm.amdgcn.workgroup.id.x()
++    %by = call i32 @llvm.amdgcn.workgroup.id.y()
++    %tx = call i32 @llvm.amdgcn.workitem.id.x()
++    %ty = call i32 @llvm.amdgcn.workitem.id.y()
++    %address = ptrtoint ptr addrspace(1) %out to i64
++    %value = call i32 @stage(i32 %bx, i32 %by, i64 %address,
++                            i32 %tx, i32 %ty, i32 7)
++    ; The compiler can continue using caller values after the assembly call.
++    %slot = getelementptr i32, ptr addrspace(1) %out, i32 %tx
++    store i32 %value, ptr addrspace(1) %slot
++    ret void
++  }
++
++  attributes #0 = { "amdgpu-asm-full-wave-calls"="true" }
++  attributes #1 = {
++    convergent nounwind norecurse
++    "amdgpu-asm-contract"="1"
++    "amdgpu-asm-arg-regs"="s0,s1,v[0:1],v2,v3,s2"
++    "amdgpu-asm-result-reg"="v4"
++    "amdgpu-asm-clobbers"="s[4:7],v[4:15],scc"
++    "amdgpu-asm-vgpr-count"="16"
++    "amdgpu-asm-sgpr-count"="32"
++    "amdgpu-asm-private-bytes"="0"
++  }
++
++The two s0/s1 values are separate u32 workgroup coordinates. The v0:v1 value is
++a 64-bit global address, not a four-dword buffer resource descriptor. Physical
++workgroup IDs, logical Mono task IDs and a supplier's tile coordinates remain
++the producer's responsibility.
++
++Spill policy and trust boundary
++------------------------------
++
++The call contract alone does not guarantee a spill-free caller. The independent
++``amdgpu-no-gpr-spill`` and ``amdgpu-no-private-memory`` policies enforce those
++requirements on generated code. Insufficient registers must produce an error,
++not an implicit scratch/LDS/global context-save fallback. A call mask protects
++live-through values; it is not a global cap on registers used by other stages.
++
++LLVM does not inspect an object which will only be supplied to a later linker.
++Its code-generation guarantees therefore assume the assembly declaration is
++truthful. A production integration needs an object/manifest identity check and
++binary audit at the packaging/link boundary. The accompanying ATOM prototype
++demonstrates that additional layer. A standalone launchable HSA code object is
++not automatically a callable function just because it is named ``.co``.
+diff --git a/llvm/docs/AMDGPUUsage.md b/llvm/docs/AMDGPUUsage.md
+index 8a8eb1d0b6fc..45974093dbec 100644
+--- a/llvm/docs/AMDGPUUsage.md
++++ b/llvm/docs/AMDGPUUsage.md
+@@ -9,6 +9,8 @@ AMDGPUModifierSyntax
+ AMDGPUOperandSyntax
+ AMDGPUInstructionSyntax
+ AMDGPUInstructionNotation
++AMDGPUExternalAsmContract
++AMDGPUAsmStrictPolicies
+ AMDGPUDwarfExtensionsForHeterogeneousDebugging
+ AMDGPUDwarfExtensionAllowLocationDescriptionOnTheDwarfExpressionStack/AMDGPUDwarfExtensionAllowLocationDescriptionOnTheDwarfExpressionStack
+ AMDGPU/DeveloperGuideline
+@@ -20,6 +22,10 @@ The AMDGPU backend provides ISA code generation for AMD GPUs, starting with the
+ R600 family up until the current GCN families. It lives in the
+ `llvm/lib/Target/AMDGPU` directory.
+ 
++This experimental branch additionally provides an
++{doc}`external assembly call contract <AMDGPUExternalAsmContract>` and
++{doc}`strict register-spill and private-memory policies <AMDGPUAsmStrictPolicies>`.
++
+ ## LLVM
+ 
+ (amdgpu-target-triples)=
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUAsmCallContract.cpp b/llvm/lib/Target/AMDGPU/AMDGPUAsmCallContract.cpp
+new file mode 100644
+index 000000000000..32e35afd5982
+--- /dev/null
++++ b/llvm/lib/Target/AMDGPU/AMDGPUAsmCallContract.cpp
+@@ -0,0 +1,239 @@
++//===- AMDGPUAsmCallContract.cpp - External assembly calls
++//-----------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "AMDGPUAsmCallContract.h"
++#include "GCNSubtarget.h"
++#include "SIRegisterInfo.h"
++#include "llvm/ADT/BitVector.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/IR/Function.h"
++#include "llvm/MC/MCRegisterInfo.h"
++#include "llvm/Support/MathExtras.h"
++
++using namespace llvm;
++
++MCRegister AMDGPUAsmCallContract::RegisterSpan::getDWord(unsigned Part) const {
++  assert(Part < Count);
++  return Kind == 's' ? AMDGPU::SGPR_32RegClass.getRegister(First + Part)
++                     : AMDGPU::VGPR_32RegClass.getRegister(First + Part);
++}
++
++bool llvm::hasAMDGPUAsmCallContract(const Function &F) {
++  return F.hasFnAttribute("amdgpu-asm-contract");
++}
++
++namespace {
++Error contractError(const Function &F, const Twine &Message) {
++  return createStringError(
++      inconvertibleErrorCode(),
++      ("AMDGPU ASM contract for '" + F.getName() + "': " + Message).str());
++}
++
++Expected<unsigned> readCount(const Function &F, StringRef Name) {
++  Attribute A = F.getFnAttribute(Name);
++  unsigned Count;
++  if (!A.isStringAttribute() || A.getValueAsString().empty() ||
++      A.getValueAsString().getAsInteger(10, Count))
++    return contractError(F, "expected unsigned integer attribute " + Name);
++  return Count;
++}
++
++Expected<AMDGPUAsmCallContract::RegisterSpan>
++parseSpan(const Function &F, StringRef Text, const GCNSubtarget &ST) {
++  Text = Text.trim();
++  if (Text.size() < 2 || (Text[0] != 's' && Text[0] != 'v'))
++    return contractError(F, "invalid numbered register '" + Text + "'");
++  char Kind = Text.front();
++  StringRef Index = Text.drop_front();
++  unsigned First, Last;
++  if (Index.starts_with("[") && Index.ends_with("]")) {
++    auto Pair = Index.drop_front().drop_back().split(':');
++    if (Pair.second.empty() || Pair.first.getAsInteger(10, First) ||
++        Pair.second.getAsInteger(10, Last) || Last < First)
++      return contractError(F, "invalid register range '" + Text + "'");
++  } else {
++    if (Index.getAsInteger(10, First))
++      return contractError(F, "invalid register '" + Text + "'");
++    Last = First;
++  }
++  unsigned Limit = Kind == 's' ? ST.getAddressableNumSGPRs()
++                               : ST.getAddressableNumArchVGPRs();
++  if (Last >= Limit)
++    return contractError(F, "register range exceeds target limits: '" + Text +
++                                "'");
++  // Version 1 retains the normal return-PC and stack bookkeeping registers.
++  // They are not an implicit argument block and the callee may not use them as
++  // ordinary parameters, results or destructive temporaries.
++  if (Kind == 's' && First <= 39 && Last >= 30)
++    return contractError(F, "s[30:39] are reserved for call state");
++  return AMDGPUAsmCallContract::RegisterSpan{Kind, First, Last - First + 1};
++}
++
++unsigned typeDWords(Type *Ty, const DataLayout &DL) {
++  if (Ty->isIntegerTy(32))
++    return 1;
++  if (Ty->isIntegerTy(64))
++    return 2;
++  if (Ty->isPointerTy() && DL.getTypeSizeInBits(Ty) == 64)
++    return 2;
++  return 0;
++}
++} // namespace
++
++Expected<AMDGPUAsmCallContract>
++llvm::parseAMDGPUAsmCallContract(const Function &F, const GCNSubtarget &ST) {
++  if (F.getFnAttribute("amdgpu-asm-contract").getValueAsString() != "1")
++    return contractError(F, "unsupported contract version (expected 1)");
++  if (!ST.hasGFX1250Insts() || !ST.isWave32() ||
++      ST.getTargetTriple().getOS() != Triple::AMDHSA)
++    return contractError(F, "version 1 requires gfx1250 wave32 AMDHSA");
++  if (!F.isDeclaration() || F.isIntrinsic())
++    return contractError(F,
++                         "version 1 requires an external assembly declaration");
++  if (F.hasAddressTaken())
++    return contractError(
++        F, "version 1 forbids address escapes, aliases, and signature casts");
++  if (F.getCallingConv() != CallingConv::C || F.isVarArg())
++    return contractError(
++        F, "version 1 requires a non-variadic C call declaration");
++  if (!F.isConvergent() || !F.doesNotThrow() || !F.doesNotRecurse())
++    return contractError(F,
++                         "declaration must be convergent nounwind norecurse");
++
++  AMDGPUAsmCallContract C;
++  auto V = readCount(F, "amdgpu-asm-vgpr-count");
++  if (!V)
++    return V.takeError();
++  C.NumVGPRs = *V;
++  auto S = readCount(F, "amdgpu-asm-sgpr-count");
++  if (!S)
++    return S.takeError();
++  C.NumSGPRs = *S;
++  auto P = readCount(F, "amdgpu-asm-private-bytes");
++  if (!P)
++    return P.takeError();
++  C.PrivateBytes = *P;
++  if (C.PrivateBytes != 0)
++    return contractError(F, "version 1 forbids private memory");
++  if (C.NumVGPRs > ST.getAddressableNumArchVGPRs() || C.NumSGPRs < 32 ||
++      C.NumSGPRs > ST.getAddressableNumSGPRs())
++    return contractError(F, "invalid register resource extent (SGPR extent "
++                            "must include return PC s[30:31])");
++
++  auto CheckExtent =
++      [&](const AMDGPUAsmCallContract::RegisterSpan &R) -> Error {
++    if (R.First + R.Count > (R.Kind == 's' ? C.NumSGPRs : C.NumVGPRs))
++      return contractError(F, "register use exceeds declared resource extent");
++    return Error::success();
++  };
++  auto CheckType = [&](const AMDGPUAsmCallContract::RegisterSpan &R,
++                       Type *Ty) -> Error {
++    if (!typeDWords(Ty, F.getDataLayout()) ||
++        R.Count != typeDWords(Ty, F.getDataLayout()))
++      return contractError(
++          F, "register width must match a 32/64-bit scalar argument or result");
++    if (R.Count == 2 && R.First % 2)
++      return contractError(
++          F, "64-bit register tuples must start at an even register");
++    return CheckExtent(R);
++  };
++
++  Attribute ArgAttr = F.getFnAttribute("amdgpu-asm-arg-regs");
++  if (!ArgAttr.isStringAttribute())
++    return contractError(F, "missing amdgpu-asm-arg-regs");
++  SmallVector<StringRef, 8> Names;
++  if (!ArgAttr.getValueAsString().empty())
++    ArgAttr.getValueAsString().split(Names, ',');
++  if (Names.size() != F.arg_size())
++    return contractError(F, "argument register count does not match signature");
++  BitVector Used(ST.getRegisterInfo()->getNumRegs());
++  for (auto [Arg, Name] : zip(F.args(), Names)) {
++    if (Arg.hasByValAttr() || Arg.hasStructRetAttr() || Arg.hasInAllocaAttr() ||
++        Arg.hasAttribute(Attribute::ByRef) ||
++        Arg.hasAttribute(Attribute::Preallocated))
++      return contractError(
++          F, "memory/aggregate argument attributes are unsupported");
++    auto R = parseSpan(F, Name, ST);
++    if (!R)
++      return R.takeError();
++    if (Error E = CheckType(*R, Arg.getType()))
++      return std::move(E);
++    for (unsigned I = 0; I < R->Count; ++I) {
++      unsigned Reg = R->getDWord(I);
++      if (Used.test(Reg))
++        return contractError(F, "overlapping argument register bindings");
++      Used.set(Reg);
++    }
++    C.ArgRegs.push_back(*R);
++  }
++
++  Attribute ResultAttr = F.getFnAttribute("amdgpu-asm-result-reg");
++  StringRef ResultName = ResultAttr.isStringAttribute()
++                             ? ResultAttr.getValueAsString()
++                             : StringRef();
++  if (F.getReturnType()->isVoidTy()) {
++    if (!ResultName.empty())
++      return contractError(F, "void function cannot bind a result register");
++  } else {
++    auto R = parseSpan(F, ResultName, ST);
++    if (!R)
++      return R.takeError();
++    if (Error E = CheckType(*R, F.getReturnType()))
++      return std::move(E);
++    C.ResultReg = *R;
++  }
++
++  Attribute ClobberAttr = F.getFnAttribute("amdgpu-asm-clobbers");
++  if (!ClobberAttr.isStringAttribute())
++    return contractError(F, "missing complete amdgpu-asm-clobbers declaration");
++  Names.clear();
++  if (!ClobberAttr.getValueAsString().empty())
++    ClobberAttr.getValueAsString().split(Names, ',');
++  for (StringRef Name : Names) {
++    Name = Name.trim();
++    if (Name == "scc") {
++      C.ClobberedRegs.push_back(AMDGPU::SCC);
++      // The encoded read-only source view is not a TableGen register alias.
++      C.ClobberedRegs.push_back(AMDGPU::SRC_SCC);
++      continue;
++    }
++    if (Name == "vcc") {
++      C.ClobberedRegs.push_back(AMDGPU::VCC);
++      C.ClobberedRegs.push_back(AMDGPU::SRC_VCCZ);
++      C.ClobbersVCC = true;
++      continue;
++    }
++    auto R = parseSpan(F, Name, ST);
++    if (!R)
++      return R.takeError();
++    if (Error E = CheckExtent(*R))
++      return std::move(E);
++    for (unsigned I = 0; I < R->Count; ++I)
++      C.ClobberedRegs.push_back(R->getDWord(I));
++  }
++  // A result is a definition, regardless of whether the supplier redundantly
++  // included it in the net clobber list.
++  if (C.ResultReg)
++    for (unsigned I = 0; I < C.ResultReg->Count; ++I)
++      C.ClobberedRegs.push_back(C.ResultReg->getDWord(I));
++  return C;
++}
++
++const uint32_t *
++AMDGPUAsmCallContract::createCallPreservedMask(MachineFunction &MF) const {
++  const SIRegisterInfo &TRI =
++      *MF.getSubtarget<GCNSubtarget>().getRegisterInfo();
++  uint32_t *Mask = MF.allocateRegMask();
++  std::fill_n(Mask, MachineOperand::getRegMaskSize(TRI.getNumRegs()), ~0u);
++  Mask[0] &= ~1u;
++  for (MCRegister Reg : ClobberedRegs)
++    for (MCRegAliasIterator Alias(Reg, &TRI, true); Alias.isValid(); ++Alias)
++      Mask[*Alias / 32] &= ~(uint32_t(1) << (*Alias % 32));
++  return Mask;
++}
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUAsmCallContract.h b/llvm/lib/Target/AMDGPU/AMDGPUAsmCallContract.h
+new file mode 100644
+index 000000000000..07bb46f4e21d
+--- /dev/null
++++ b/llvm/lib/Target/AMDGPU/AMDGPUAsmCallContract.h
+@@ -0,0 +1,55 @@
++//===- AMDGPUAsmCallContract.h - External assembly calls ----------*- C++
++//-*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_AMDGPU_AMDGPUASMCALLCONTRACT_H
++#define LLVM_LIB_TARGET_AMDGPU_AMDGPUASMCALLCONTRACT_H
++
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/MC/MCRegister.h"
++#include "llvm/Support/Error.h"
++#include <optional>
++
++namespace llvm {
++class Function;
++class GCNSubtarget;
++class MachineFunction;
++
++/// Experimental, versioned ABI for a directly called external leaf assembly
++/// function. Version 1 requires full EXEC, preserves all execution state except
++/// explicitly declared SCC/VCC clobbers, and uses s[30:31] for the return PC.
++/// The object supplier is responsible for fulfilling this contract.
++struct AMDGPUAsmCallContract {
++  struct RegisterSpan {
++    char Kind;
++    unsigned First;
++    unsigned Count;
++    MCRegister getDWord(unsigned Part = 0) const;
++  };
++
++  SmallVector<RegisterSpan, 8> ArgRegs;
++  std::optional<RegisterSpan> ResultReg;
++  SmallVector<MCRegister, 32> ClobberedRegs;
++  unsigned NumVGPRs = 0;
++  unsigned NumSGPRs = 0;
++  unsigned PrivateBytes = 0;
++  bool ClobbersVCC = false;
++
++  /// Allocate a MachineFunction-owned mask, including all register aliases.
++  /// Argument copies and call-target temporaries remain normal MI operands;
++  /// their liveness is not hidden in the supplier's mask.
++  const uint32_t *createCallPreservedMask(MachineFunction &MF) const;
++};
++
++bool hasAMDGPUAsmCallContract(const Function &F);
++Expected<AMDGPUAsmCallContract>
++parseAMDGPUAsmCallContract(const Function &F, const GCNSubtarget &ST);
++
++} // namespace llvm
++
++#endif
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.cpp b/llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.cpp
+index 151a80a12e7f..f95f9aac55b0 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.cpp
++++ b/llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include "AMDGPUAsmPrinter.h"
+ #include "AMDGPU.h"
++#include "AMDGPUAsmCallContract.h"
+ #include "AMDGPUHSAMetadataStreamer.h"
+ #include "AMDGPUMCResourceInfo.h"
+ #include "AMDGPUResourceUsageAnalysis.h"
+@@ -36,10 +37,13 @@
+ #include "llvm/BinaryFormat/ELF.h"
+ #include "llvm/CodeGen/AsmPrinterAnalysis.h"
+ #include "llvm/CodeGen/AsmPrinterHandler.h"
++#include "llvm/CodeGen/LivePhysRegs.h"
+ #include "llvm/CodeGen/MachineFrameInfo.h"
+ #include "llvm/CodeGen/MachineModuleInfo.h"
+ #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
+ #include "llvm/IR/DiagnosticInfo.h"
++#include "llvm/IR/InlineAsm.h"
++#include "llvm/IR/Instructions.h"
+ #include "llvm/MC/MCAssembler.h"
+ #include "llvm/MC/MCContext.h"
+ #include "llvm/MC/MCSectionELF.h"
+@@ -47,7 +51,10 @@
+ #include "llvm/MC/MCValue.h"
+ #include "llvm/MC/TargetRegistry.h"
+ #include "llvm/Support/AMDHSAKernelDescriptor.h"
++#include "llvm/Support/CommandLine.h"
+ #include "llvm/Support/Compiler.h"
++#include "llvm/Support/FileSystem.h"
++#include "llvm/Support/FormatVariadic.h"
+ #include "llvm/Target/TargetLoweringObjectFile.h"
+ #include "llvm/Target/TargetMachine.h"
+ #include "llvm/TargetParser/AMDGPUTargetParser.h"
+@@ -55,6 +62,16 @@
+ using namespace llvm;
+ using namespace llvm::AMDGPU;
+ 
++static cl::opt<std::string> AsmContractReportPath(
++    "amdgpu-asm-contract-report", cl::Hidden,
++    cl::desc("Write external ASM call and strict no-spill facts as JSON"),
++    cl::init(""));
++
++enum StrictFunctionPolicy : unsigned {
++  NoGPRSpill = 1,
++  NoPrivateMemory = 2,
++};
++
+ // This should get the default rounding mode from the kernel. We just set the
+ // default here, but this could change if the OpenCL rounding mode pragmas are
+ // used.
+@@ -387,7 +404,258 @@ void AMDGPUAsmPrinter::emitGlobalVariable(const GlobalVariable *GV) {
+   AsmPrinter::emitGlobalVariable(GV);
+ }
+ 
++void AMDGPUAsmPrinter::strictPolicyError(const Function &F,
++                                         const Twine &Message) {
++  StrictPolicyFailed = true;
++  F.getContext().diagnose(DiagnosticInfoUnsupported(F, Message));
++}
++
++void AMDGPUAsmPrinter::collectStrictPolicyFunctions(
++    const Function &F, unsigned Policy,
++    SmallPtrSetImpl<const Function *> &Active) {
++  if (Active.contains(&F)) {
++    strictPolicyError(F,
++                      "AMDGPU strict register policy cannot verify recursive "
++                      "calls");
++    return;
++  }
++  unsigned &Applied = StrictFunctionPolicies[&F];
++  if ((Applied & Policy) == Policy)
++    return;
++  Applied |= Policy;
++  Active.insert(&F);
++
++  for (const BasicBlock &BB : F) {
++    for (const Instruction &I : BB) {
++      const auto *CB = dyn_cast<CallBase>(&I);
++      if (!CB || CB->isInlineAsm())
++        continue;
++      const auto *Callee = dyn_cast<Function>(
++          CB->getCalledOperand()->stripPointerCastsAndAliases());
++      if (!Callee) {
++        strictPolicyError(F, "AMDGPU strict register policy cannot verify an "
++                             "indirect call");
++        continue;
++      }
++      if (Callee->isIntrinsic())
++        continue;
++      if (!Callee->isDeclaration()) {
++        collectStrictPolicyFunctions(*Callee, Policy, Active);
++        continue;
++      }
++      if (!hasAMDGPUAsmCallContract(*Callee)) {
++        strictPolicyError(F, "AMDGPU strict register policy requires an ASM "
++                             "contract for external callee '" +
++                                 Callee->getName() + "'");
++        continue;
++      }
++      auto Contract =
++          parseAMDGPUAsmCallContract(*Callee, TM.getSubtarget<GCNSubtarget>(F));
++      if (!Contract) {
++        strictPolicyError(F, toString(Contract.takeError()));
++        continue;
++      }
++      StrictFunctionPolicies[Callee] |= Policy;
++    }
++  }
++  Active.erase(&F);
++}
++
++void AMDGPUAsmPrinter::validateStrictFunctionPolicy(MachineFunction &MF) {
++  const Function &F = MF.getFunction();
++  unsigned Policy = StrictFunctionPolicies.lookup(&F);
++  if (!Policy && AsmContractReportPath.empty())
++    return;
++
++  const auto &MFI = *MF.getInfo<SIMachineFunctionInfo>();
++  const MachineFrameInfo &Frame = MF.getFrameInfo();
++  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
++  const SIInstrInfo &TII = *ST.getInstrInfo();
++  const SIRegisterInfo &TRI = *ST.getRegisterInfo();
++  unsigned SGPRLaneSaves = 0, SGPRMemorySaves = 0, CSRMemorySaves = 0;
++  for (const auto &Save : MFI.getPrologEpilogSGPRSpills()) {
++    SGPRLaneSaves += Save.second.getKind() == SGPRSaveKind::SPILL_TO_VGPR_LANE;
++    SGPRMemorySaves += Save.second.getKind() == SGPRSaveKind::SPILL_TO_MEM;
++  }
++  for (const CalleeSavedInfo &Save : Frame.getCalleeSavedInfo())
++    CSRMemorySaves += !Save.isSpilledToReg();
++
++  if ((Policy & NoGPRSpill) &&
++      (MFI.getNumSpilledSGPRs() || MFI.getNumSpilledVGPRs() || SGPRLaneSaves ||
++       SGPRMemorySaves || CSRMemorySaves || !MFI.getWWMSpills().empty()))
++    strictPolicyError(
++        F, "amdgpu-no-gpr-spill violated: generated GPR spill or "
++           "callee-saved spill (SGPR spill dwords=" +
++               Twine(MFI.getNumSpilledSGPRs()) +
++               ", VGPR spill dwords=" + Twine(MFI.getNumSpilledVGPRs()) +
++               ", SGPR ABI lane saves=" + Twine(SGPRLaneSaves) +
++               ", ABI memory saves=" + Twine(SGPRMemorySaves + CSRMemorySaves) +
++               ")");
++
++  if ((Policy & NoPrivateMemory) &&
++      (Frame.getStackSize() || Frame.hasVarSizedObjects() ||
++       MFI.getBytesInStackArgArea() || MFI.getScratchReservedForDynamicVGPRs()))
++    strictPolicyError(F, "amdgpu-no-private-memory violated: private frame, "
++                         "stack arguments or dynamic scratch (frame bytes=" +
++                             Twine(Frame.getStackSize()) +
++                             ", incoming stack argument bytes=" +
++                             Twine(MFI.getBytesInStackArgArea()) + ")");
++
++  unsigned PrivateAccesses = 0, OpaqueInlineAsms = 0;
++  json::Array Calls;
++  BitVector Allocatable = TRI.getAllocatableSet(MF);
++  auto RegName = [&TRI](MCRegister Reg) {
++    if (AMDGPU::SGPR_32RegClass.contains(Reg))
++      return ("s" + Twine(TRI.getHWRegIndex(Reg))).str();
++    if (AMDGPU::VGPR_32RegClass.contains(Reg))
++      return ("v" + Twine(TRI.getHWRegIndex(Reg))).str();
++    return std::string(TRI.getName(Reg));
++  };
++
++  for (const MachineBasicBlock &MBB : MF) {
++    LivePhysRegs Live(TRI);
++    Live.addLiveOuts(MBB);
++    for (const MachineInstr &MI : llvm::reverse(MBB)) {
++      if (MI.mayLoadOrStore() &&
++          (TII.mayAccessScratch(MI) ||
++           llvm::any_of(MI.memoperands(), [](const MachineMemOperand *MMO) {
++             return MMO->getAddrSpace() == AMDGPUAS::PRIVATE_ADDRESS;
++           })))
++        ++PrivateAccesses;
++
++      if (MI.isInlineAsm()) {
++        const MachineOperand &Text = MI.getOperand(InlineAsm::MIOp_AsmString);
++        if (Text.isSymbol() && !StringRef(Text.getSymbolName()).trim().empty())
++          ++OpaqueInlineAsms;
++      }
++
++      SmallVector<MCPhysReg, 32> LiveAfter;
++      if (MI.isCall())
++        LiveAfter.append(Live.begin(), Live.end());
++      Live.stepBackward(MI);
++      if (!MI.isCall())
++        continue;
++
++      const MachineOperand *CalleeOp =
++          TII.getNamedOperand(MI, AMDGPU::OpName::callee);
++      const Function *Callee = nullptr;
++      if (CalleeOp && CalleeOp->isGlobal())
++        Callee = dyn_cast<Function>(
++            CalleeOp->getGlobal()->stripPointerCastsAndAliases());
++      if (Policy && (!Callee || !StrictFunctionPolicies.count(Callee)))
++        strictPolicyError(F, "AMDGPU strict register policy encountered an "
++                             "unverified machine-code callee");
++
++      json::Array LiveThrough, Preserved;
++      // This describes the call instruction, after argument preparation. A
++      // before/after intersection alone is not enough: a result can redefine
++      // a register that also held an input. Exclude all call defs/regmasks.
++      llvm::sort(LiveAfter);
++      for (MCPhysReg Reg : LiveAfter) {
++        if ((AMDGPU::SGPR_32RegClass.contains(Reg) ||
++             AMDGPU::VGPR_32RegClass.contains(Reg)) &&
++            Live.contains(Reg) && !MI.modifiesRegister(Reg, &TRI))
++          LiveThrough.push_back(RegName(Reg));
++      }
++      for (const TargetRegisterClass *RC :
++           {&AMDGPU::SGPR_32RegClass, &AMDGPU::VGPR_32RegClass})
++        for (MCPhysReg Reg : RC->getRegisters())
++          if (Allocatable.test(Reg) && !MI.modifiesRegister(Reg, &TRI))
++            Preserved.push_back(RegName(Reg));
++
++      json::Object Call{
++          {"callee", Callee ? Callee->getName() : "<indirect>"},
++          {"machine_block", MBB.getNumber()},
++          {"call_instruction_live_through", std::move(LiveThrough)},
++          {"preserved_allocatable_gprs", std::move(Preserved)}};
++      if (Callee && hasAMDGPUAsmCallContract(*Callee)) {
++        Call["contract_version"] =
++            Callee->getFnAttribute("amdgpu-asm-contract").getValueAsString();
++        Call["full_wave_precondition"] = "caller_asserted";
++        for (StringRef Attr :
++             {"amdgpu-asm-arg-regs", "amdgpu-asm-result-reg",
++              "amdgpu-asm-clobbers", "amdgpu-asm-vgpr-count",
++              "amdgpu-asm-sgpr-count", "amdgpu-asm-private-bytes"})
++          if (Callee->hasFnAttribute(Attr))
++            Call[Attr] = Callee->getFnAttribute(Attr).getValueAsString();
++      }
++      Calls.push_back(std::move(Call));
++    }
++  }
++
++  if ((Policy & NoPrivateMemory) && PrivateAccesses)
++    strictPolicyError(
++        F, "amdgpu-no-private-memory violated: " + Twine(PrivateAccesses) +
++               " instruction(s) may access private memory");
++  if (Policy && OpaqueInlineAsms)
++    strictPolicyError(F,
++                      "AMDGPU strict register policy cannot verify nonempty "
++                      "inline assembly; use an audited external ASM contract");
++
++  if (!AsmContractReportPath.empty()) {
++    AsmContractReports.push_back(json::Object{
++        {"function", F.getName()},
++        {"no_gpr_spill", bool(Policy & NoGPRSpill)},
++        {"no_private_memory", bool(Policy & NoPrivateMemory)},
++        {"lowered_sgpr_spill_dwords", MFI.getNumSpilledSGPRs()},
++        {"lowered_vgpr_spill_dwords", MFI.getNumSpilledVGPRs()},
++        {"sgpr_abi_lane_saves", SGPRLaneSaves},
++        {"abi_memory_saves", SGPRMemorySaves + CSRMemorySaves},
++        {"wwm_spill_registers", MFI.getWWMSpills().size()},
++        {"private_frame_bytes", Frame.getStackSize()},
++        {"incoming_stack_argument_bytes", MFI.getBytesInStackArgArea()},
++        {"dynamic_stack", Frame.hasVarSizedObjects()},
++        {"private_access_instructions", PrivateAccesses},
++        {"opaque_inline_asm_instructions", OpaqueInlineAsms},
++        {"analyzed_vgpr_extent", ResourceUsage->NumVGPR},
++        {"analyzed_sgpr_extent", ResourceUsage->NumExplicitSGPR},
++        {"calls", std::move(Calls)}});
++  }
++}
++
++void AMDGPUAsmPrinter::emitAsmContractReport(Module &M) {
++  if (AsmContractReportPath.empty())
++    return;
++  std::error_code EC;
++  raw_fd_ostream OS(AsmContractReportPath, EC, sys::fs::OF_Text);
++  if (EC) {
++    M.getContext().diagnose(DiagnosticInfoGeneric(
++        "cannot write AMDGPU ASM contract report: " + EC.message(), DS_Error));
++    return;
++  }
++  OS << formatv("{0:2}\n",
++                json::Value(json::Object{
++                    {"schema", "amdgpu.asm_contract_report.v1"},
++                    {"scope", "compiled_module_and_declared_contracts"},
++                    {"strict_policy_status", StrictPolicyFailed ? "rejected"
++                                             : StrictFunctionPolicies.empty()
++                                                 ? "not_requested"
++                                                 : "checked"},
++                    {"external_object_audit_required", true},
++                    {"functions", std::move(AsmContractReports)}}));
++}
++
+ bool AMDGPUAsmPrinter::doInitialization(Module &M) {
++  StrictFunctionPolicies.clear();
++  AsmContractReports.clear();
++  StrictPolicyFailed = false;
++  for (const Function &F : M) {
++    unsigned Policy = 0;
++    if (F.hasFnAttribute("amdgpu-no-gpr-spill"))
++      Policy |= NoGPRSpill;
++    if (F.hasFnAttribute("amdgpu-no-private-memory"))
++      Policy |= NoPrivateMemory;
++    if (Policy && !F.isDeclaration()) {
++      SmallPtrSet<const Function *, 8> Active;
++      collectStrictPolicyFunctions(F, Policy, Active);
++      if (llvm::any_of(M.getModuleInlineAsm(),
++                       [](const Module::GlobalAsmFragment &Fragment) {
++                         return !StringRef(Fragment.Asm).trim().empty();
++                       }))
++        strictPolicyError(F, "AMDGPU strict register policy cannot verify "
++                             "module-level inline assembly");
++    }
++  }
+   const Triple &TT = M.getTargetTriple();
+   if (TT.getSubArch() == Triple::NoSubArch) {
+     Triple::SubArchType SubArch =
+@@ -505,6 +773,18 @@ void AMDGPUAsmPrinter::validateMCResourceInfo(Function &F) {
+     F.getContext().diagnose(DiagStackSize);
+   }
+ 
++  if (StrictFunctionPolicies.lookup(&F) & NoPrivateMemory) {
++    if (!ScratchSizeSymbol->isVariable() ||
++        !TryGetMCExprValue(ScratchSizeSymbol->getVariableValue(), ScratchSize))
++      strictPolicyError(F, "amdgpu-no-private-memory cannot verify the final "
++                           "call-graph private-memory requirement");
++    else if (ScratchSize)
++      strictPolicyError(F,
++                        "amdgpu-no-private-memory violated: final call-graph "
++                        "private bytes=" +
++                            Twine(ScratchSize));
++  }
++
+   // Validate addressable scalar registers (i.e., prior to added implicit
+   // SGPRs).
+   MCSymbol *NumSGPRSymbol =
+@@ -771,6 +1051,8 @@ bool AMDGPUAsmPrinter::doFinalization(Module &M) {
+       validateMCResourceInfo(F);
+   }
+ 
++  emitAsmContractReport(M);
++
+   RI.reset();
+ 
+   return AsmPrinter::doFinalization(M);
+@@ -906,6 +1188,7 @@ bool AMDGPUAsmPrinter::runOnMachineFunction(MachineFunction &MF) {
+     initTargetStreamer(*MF.getFunction().getParent());
+ 
+   ResourceUsage = GetResourceUsage(MF);
++  validateStrictFunctionPolicy(MF);
+   CurrentProgramInfo.reset(MF);
+ 
+   const AMDGPUMachineFunctionInfo *MFI =
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.h b/llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.h
+index 4394cde30866..2c86ae1ce940 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.h
++++ b/llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.h
+@@ -18,8 +18,11 @@
+ #include "AMDGPUResourceUsageAnalysis.h"
+ #include "MCTargetDesc/AMDGPUTargetStreamer.h"
+ #include "SIProgramInfo.h"
++#include "llvm/ADT/DenseMap.h"
+ #include "llvm/ADT/SetVector.h"
++#include "llvm/ADT/SmallPtrSet.h"
+ #include "llvm/CodeGen/AsmPrinter.h"
++#include "llvm/Support/JSON.h"
+ 
+ namespace llvm {
+ 
+@@ -96,6 +99,17 @@ private:
+ 
+   SmallVector<AMDGPU::FuncInfo, 8> FunctionInfos;
+ 
++  // Policies inherited from strict roots, including transitive direct callees.
++  DenseMap<const Function *, unsigned> StrictFunctionPolicies;
++  json::Array AsmContractReports;
++  bool StrictPolicyFailed = false;
++
++  void collectStrictPolicyFunctions(const Function &F, unsigned Policy,
++                                    SmallPtrSetImpl<const Function *> &Active);
++  void strictPolicyError(const Function &F, const Twine &Message);
++  void validateStrictFunctionPolicy(MachineFunction &MF);
++  void emitAsmContractReport(Module &M);
++
+   SmallString<128> getMCExprStr(const MCExpr *Value);
+ 
+   /// Attempts to replace the validation that is missed in getSIProgramInfo due
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUCallLowering.cpp b/llvm/lib/Target/AMDGPU/AMDGPUCallLowering.cpp
+index 8a2381d3c1c0..1f1740f5acb8 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUCallLowering.cpp
++++ b/llvm/lib/Target/AMDGPU/AMDGPUCallLowering.cpp
+@@ -14,6 +14,7 @@
+ 
+ #include "AMDGPUCallLowering.h"
+ #include "AMDGPU.h"
++#include "AMDGPUAsmCallContract.h"
+ #include "AMDGPULegalizerInfo.h"
+ #include "SIMachineFunctionInfo.h"
+ #include "SIRegisterInfo.h"
+@@ -23,6 +24,7 @@
+ #include "llvm/CodeGen/MachineFrameInfo.h"
+ #include "llvm/CodeGen/PseudoSourceValueManager.h"
+ #include "llvm/IR/IntrinsicsAMDGPU.h"
++#include "llvm/IR/Module.h"
+ 
+ #define DEBUG_TYPE "amdgpu-call-lowering"
+ 
+@@ -650,6 +652,15 @@ bool AMDGPUCallLowering::lowerFormalArgumentsKernel(
+ bool AMDGPUCallLowering::lowerFormalArguments(
+     MachineIRBuilder &B, const Function &F, ArrayRef<ArrayRef<Register>> VRegs,
+     FunctionLoweringInfo &FLI) const {
++  if (hasAMDGPUAsmCallContract(F))
++    report_fatal_error("AMDGPU ASM contract: definitions are unsupported; "
++                       "provide an external assembly object",
++                       false);
++  for (const Function &External : *F.getParent())
++    if (hasAMDGPUAsmCallContract(External))
++      report_fatal_error("AMDGPU ASM contract: GlobalISel is not supported; "
++                         "use -global-isel=0",
++                         false);
+   CallingConv::ID CC = F.getCallingConv();
+ 
+   // The infrastructure for normal calling convention lowering is essentially
+@@ -1579,6 +1590,10 @@ bool AMDGPUCallLowering::lowerChainCall(MachineIRBuilder &MIRBuilder,
+ 
+ bool AMDGPUCallLowering::lowerCall(MachineIRBuilder &MIRBuilder,
+                                    CallLoweringInfo &Info) const {
++  if (Info.CB && Info.CB->hasFnAttr("amdgpu-asm-contract"))
++    report_fatal_error(
++        "AMDGPU ASM contract: GlobalISel is not supported; use -global-isel=0",
++        false);
+   if (Function *F = Info.CB->getCalledFunction())
+     if (F->isIntrinsic()) {
+       switch (F->getIntrinsicID()) {
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUResourceUsageAnalysis.cpp b/llvm/lib/Target/AMDGPU/AMDGPUResourceUsageAnalysis.cpp
+index f938e20964ca..79e01e694f23 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUResourceUsageAnalysis.cpp
++++ b/llvm/lib/Target/AMDGPU/AMDGPUResourceUsageAnalysis.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include "AMDGPUResourceUsageAnalysis.h"
+ #include "AMDGPU.h"
++#include "AMDGPUAsmCallContract.h"
+ #include "AMDGPUTargetMachine.h"
+ #include "GCNSubtarget.h"
+ #include "SIMachineFunctionInfo.h"
+@@ -245,6 +246,20 @@ AMDGPUResourceUsageAnalysisImpl::analyzeResourceUsage(
+         const Function *Callee =
+             CalleeOp ? getCalleeFunction(*CalleeOp) : nullptr;
+ 
++        // An audited external leaf has known resources. Merge these constants
++        // here instead of treating the declaration as an unknown indirect
++        // call, or creating undefined callee resource-expression symbols.
++        if (Callee && hasAMDGPUAsmCallContract(*Callee)) {
++          auto Contract = parseAMDGPUAsmCallContract(*Callee, ST);
++          if (!Contract)
++            report_fatal_error(Twine(toString(Contract.takeError())), false);
++          MaxVGPR = std::max(MaxVGPR, int32_t(Contract->NumVGPRs) - 1);
++          Info.NumExplicitSGPR =
++              std::max(Info.NumExplicitSGPR, int32_t(Contract->NumSGPRs));
++          Info.UsesVCC |= Contract->ClobbersVCC;
++          continue;
++        }
++
+         auto isSameFunction = [](const MachineFunction &MF, const Function *F) {
+           return F == &MF.getFunction();
+         };
+diff --git a/llvm/lib/Target/AMDGPU/CMakeLists.txt b/llvm/lib/Target/AMDGPU/CMakeLists.txt
+index 5ed7d2acd4e0..cd5d13c39895 100644
+--- a/llvm/lib/Target/AMDGPU/CMakeLists.txt
++++ b/llvm/lib/Target/AMDGPU/CMakeLists.txt
+@@ -49,6 +49,7 @@ add_llvm_target(AMDGPUCodeGen
+   AMDGPUAnnotateUniformValues.cpp
+   AMDGPUArgumentUsageInfo.cpp
+   AMDGPUAsanInstrumentation.cpp
++  AMDGPUAsmCallContract.cpp
+   AMDGPUAsmPrinter.cpp
+   AMDGPUAtomicOptimizer.cpp
+   AMDGPUAttributor.cpp
+diff --git a/llvm/lib/Target/AMDGPU/SIISelLowering.cpp b/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
+index 19e9ce6ccb31..699d3284b254 100644
+--- a/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
++++ b/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "SIISelLowering.h"
+ #include "AMDGPU.h"
++#include "AMDGPUAsmCallContract.h"
+ #include "AMDGPUIGroupLP.h"
+ #include "AMDGPUInstrInfo.h"
+ #include "AMDGPULaneMaskUtils.h"
+@@ -28,6 +29,7 @@
+ #include "llvm/ADT/FloatingPointMode.h"
+ #include "llvm/ADT/Statistic.h"
+ #include "llvm/Analysis/OptimizationRemarkEmitter.h"
++#include "llvm/Analysis/PostDominators.h"
+ #include "llvm/Analysis/UniformityAnalysis.h"
+ #include "llvm/CodeGen/Analysis.h"
+ #include "llvm/CodeGen/ByteProvider.h"
+@@ -42,11 +44,13 @@
+ #include "llvm/CodeGen/PseudoSourceValueManager.h"
+ #include "llvm/CodeGen/SDPatternMatch.h"
+ #include "llvm/IR/DiagnosticInfo.h"
++#include "llvm/IR/Dominators.h"
+ #include "llvm/IR/IRBuilder.h"
+ #include "llvm/IR/IntrinsicInst.h"
+ #include "llvm/IR/IntrinsicsAMDGPU.h"
+ #include "llvm/IR/IntrinsicsR600.h"
+ #include "llvm/IR/MDBuilder.h"
++#include "llvm/IR/Module.h"
+ #include "llvm/Support/AMDGPUAddrSpace.h"
+ #include "llvm/Support/KnownBits.h"
+ #include "llvm/Support/ModRef.h"
+@@ -3538,6 +3542,19 @@ SDValue SITargetLowering::LowerFormalArguments(
+   MachineFunction &MF = DAG.getMachineFunction();
+   const Function &Fn = MF.getFunction();
+   FunctionType *FType = MF.getFunction().getFunctionType();
++  if (hasAMDGPUAsmCallContract(Fn))
++    report_fatal_error("AMDGPU ASM contract: definitions are unsupported; "
++                       "provide an external assembly object",
++                       false);
++  // Validate even declarations whose address only escapes into an indirect
++  // call. Otherwise such a call could bypass contract-aware lowering entirely.
++  for (const Function &External : *Fn.getParent()) {
++    if (!hasAMDGPUAsmCallContract(External))
++      continue;
++    auto Contract = parseAMDGPUAsmCallContract(External, *Subtarget);
++    if (!Contract)
++      report_fatal_error(Twine(toString(Contract.takeError())), false);
++  }
+   SIMachineFunctionInfo *Info = MF.getInfo<SIMachineFunctionInfo>();
+   bool IsError = false;
+ 
+@@ -4367,6 +4384,63 @@ SDValue SITargetLowering::LowerCall(CallLoweringInfo &CLI,
+   SDValue Chain = CLI.Chain;
+   SDValue Callee = CLI.Callee;
+ 
++  // Unlike an ordinary C device call, this boundary has no hidden kernarg,
++  // workitem, workgroup, or scratch arguments. The declaration is the complete
++  // external leaf-function ABI. Keep it visible until physical allocation.
++  std::optional<AMDGPUAsmCallContract> AsmContract;
++  if (CLI.CB) {
++    const Function *F = dyn_cast<Function>(
++        CLI.CB->getCalledOperand()->stripPointerCastsAndAliases());
++    if (F && hasAMDGPUAsmCallContract(*F)) {
++      auto Parsed = parseAMDGPUAsmCallContract(*F, *Subtarget);
++      if (!Parsed)
++        report_fatal_error(Twine(toString(Parsed.takeError())), false);
++      AsmContract = std::move(*Parsed);
++      const MachineFunction &CallerMF = DAG.getMachineFunction();
++      if (AsmContract->NumVGPRs > Subtarget->getMaxNumVGPRs(CallerMF) ||
++          AsmContract->NumSGPRs > Subtarget->getMaxNumSGPRs(CallerMF))
++        report_fatal_error("AMDGPU ASM contract: callee register resource "
++                           "extent exceeds caller allocation budget",
++                           false);
++      if (DAG.getMachineFunction()
++              .getFunction()
++              .getFnAttribute("amdgpu-asm-full-wave-calls")
++              .getValueAsString() != "true")
++        report_fatal_error("AMDGPU ASM contract: caller must explicitly assert "
++                           "amdgpu-asm-full-wave-calls=true",
++                           false);
++      if (DAG.getMachineFunction()
++              .getInfo<SIMachineFunctionInfo>()
++              ->isDynamicVGPREnabled())
++        report_fatal_error(
++            "AMDGPU ASM contract: dynamic VGPR mode is unsupported", false);
++      // An explicit full-wave assertion is still required: convergence does
++      // not prove it. Reject a common statically provable violation as well:
++      // a divergent dominating branch that does not reconverge at this call.
++      if (const UniformityInfo *UI = DAG.getUniformityInfo()) {
++        Function &Caller = DAG.getMachineFunction().getFunction();
++        DominatorTree DT(Caller);
++        PostDominatorTree PDT(Caller);
++        const BasicBlock *CallBB = CLI.CB->getParent();
++        for (const BasicBlock &BB : Caller)
++          if (&BB != CallBB && UI->isDivergentTerminator(BB.getTerminator()) &&
++              DT.dominates(&BB, CallBB) && !PDT.dominates(CallBB, &BB))
++            report_fatal_error(
++                "AMDGPU ASM contract: call is controlled by a divergent branch",
++                false);
++      }
++      if (CallConv != CallingConv::C || CLI.CB->isMustTailCall())
++        report_fatal_error("AMDGPU ASM contract: only direct non-tail C device "
++                           "calls are supported",
++                           false);
++      // Optional tail-call optimization must not bypass the custom return ABI.
++      CLI.IsTailCall = false;
++    } else if (CLI.CB->hasFnAttr("amdgpu-asm-contract")) {
++      report_fatal_error(
++          "AMDGPU ASM contract: requires a directly called declaration", false);
++    }
++  }
++
+   llvm::SmallVector<SDValue, 6> ChainCallSpecialArgs;
+   bool UsesDynamicVGPRs = false;
+   if (IsChainCallConv) {
+@@ -4488,7 +4562,8 @@ SDValue SITargetLowering::LowerCall(CallLoweringInfo &CLI,
+   CCState CCInfo(CallConv, IsVarArg, MF, ArgLocs, *DAG.getContext());
+   CCAssignFn *AssignFn = CCAssignFnForCall(CallConv, IsVarArg);
+ 
+-  if (CallConv != CallingConv::AMDGPU_Gfx && !AMDGPU::isChainCC(CallConv) &&
++  if (!AsmContract && CallConv != CallingConv::AMDGPU_Gfx &&
++      !AMDGPU::isChainCC(CallConv) &&
+       CallConv != CallingConv::AMDGPU_Gfx_WholeWave) {
+     // With a fixed ABI, allocate fixed registers before user arguments.
+     passSpecialInputs(CLI, CCInfo, *Info, RegsToPass, MemOpChains, Chain);
+@@ -4496,12 +4571,35 @@ SDValue SITargetLowering::LowerCall(CallLoweringInfo &CLI,
+ 
+   // Mark the scratch resource descriptor as allocated so the CC analysis
+   // does not assign user arguments to these registers, matching the callee.
+-  if (!Subtarget->hasFlatScratchEnabled()) {
++  if (!AsmContract && !Subtarget->hasFlatScratchEnabled()) {
+     CCInfo.AllocateReg(
+         AMDGPUFunctionArgInfo::getPrivateSegmentBufferReg(CallConv));
+   }
+ 
+-  CCInfo.AnalyzeCallOperands(Outs, AssignFn);
++  if (AsmContract) {
++    for (unsigned I = 0; I < Outs.size(); ++I) {
++      const ISD::OutputArg &Out = Outs[I];
++      if (Out.OrigArgIndex >= AsmContract->ArgRegs.size() ||
++          Out.VT != MVT::i32 || Out.PartOffset % 4)
++        report_fatal_error(
++            "AMDGPU ASM contract: unsupported argument legalization", false);
++      const auto &Binding = AsmContract->ArgRegs[Out.OrigArgIndex];
++      unsigned Part = Out.PartOffset / 4;
++      if (Part >= Binding.Count)
++        report_fatal_error(
++            "AMDGPU ASM contract: argument part exceeds fixed register tuple",
++            false);
++      if (Binding.Kind == 's' && OutVals[I]->isDivergent())
++        report_fatal_error(Twine("AMDGPU ASM contract: divergent argument ") +
++                               Twine(Out.OrigArgIndex) +
++                               " cannot bind to an SGPR",
++                           false);
++      ArgLocs.push_back(CCValAssign::getReg(I, Out.VT, Binding.getDWord(Part),
++                                            Out.VT, CCValAssign::Full));
++    }
++  } else {
++    CCInfo.AnalyzeCallOperands(Outs, AssignFn);
++  }
+ 
+   // Get a count of how many bytes are to be pushed on the stack.
+   unsigned NumBytes = CCInfo.getStackSize();
+@@ -4526,7 +4624,7 @@ SDValue SITargetLowering::LowerCall(CallLoweringInfo &CLI,
+   if (!IsSibCall)
+     Chain = DAG.getCALLSEQ_START(Chain, 0, 0, DL);
+ 
+-  if (!IsSibCall || IsChainCallConv) {
++  if (!AsmContract && (!IsSibCall || IsChainCallConv)) {
+     if (!Subtarget->hasFlatScratchEnabled()) {
+       SmallVector<SDValue, 4> CopyFromChains;
+ 
+@@ -4735,7 +4833,8 @@ SDValue SITargetLowering::LowerCall(CallLoweringInfo &CLI,
+     Ops.push_back(DAG.getRegister(Reg, Val.getValueType()));
+ 
+   // Add a register mask operand representing the call-preserved registers.
+-  const uint32_t *Mask = TRI->getCallPreservedMask(MF, CallConv);
++  const uint32_t *Mask = AsmContract ? AsmContract->createCallPreservedMask(MF)
++                                     : TRI->getCallPreservedMask(MF, CallConv);
+   assert(Mask && "Missing call preserved mask for calling convention");
+   Ops.push_back(DAG.getRegisterMask(Mask));
+ 
+@@ -4792,6 +4891,24 @@ SDValue SITargetLowering::LowerCall(CallLoweringInfo &CLI,
+ 
+   // Handle result values, copying them out of physregs into vregs that we
+   // return.
++  if (AsmContract) {
++    unsigned ExpectedParts =
++        AsmContract->ResultReg ? AsmContract->ResultReg->Count : 0;
++    if (Ins.size() != ExpectedParts)
++      report_fatal_error("AMDGPU ASM contract: unsupported result legalization",
++                         false);
++    for (unsigned I = 0; I < Ins.size(); ++I) {
++      if (Ins[I].VT != MVT::i32)
++        report_fatal_error("AMDGPU ASM contract: result parts must be i32",
++                           false);
++      SDValue Value = DAG.getCopyFromReg(
++          Chain, DL, AsmContract->ResultReg->getDWord(I), MVT::i32, InGlue);
++      Chain = Value.getValue(1);
++      InGlue = Value.getValue(2);
++      InVals.push_back(Value);
++    }
++    return Chain;
++  }
+   return LowerCallResult(Chain, InGlue, CallConv, IsVarArg, Ins, DL, DAG,
+                          InVals, /*IsThisReturn=*/false, SDValue());
+ }
+diff --git a/llvm/test/CodeGen/AMDGPU/asm-call-contract-errors.ll b/llvm/test/CodeGen/AMDGPU/asm-call-contract-errors.ll
+new file mode 100644
+index 000000000000..3f5992ee1d40
+--- /dev/null
++++ b/llvm/test/CodeGen/AMDGPU/asm-call-contract-errors.ll
+@@ -0,0 +1,111 @@
++; RUN: split-file %s %t
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -global-isel=0 %t/version.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=VERSION
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -global-isel=0 %t/overlap.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=OVERLAP
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -global-isel=0 %t/width.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=WIDTH
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -global-isel=0 %t/reserved.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=RESERVED
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -global-isel=0 %t/extent.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=EXTENT
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -global-isel=0 %t/private.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=PRIVATE
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -global-isel=0 %t/fullwave.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=FULLWAVE
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -global-isel=0 %t/divergent-arg.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=DIVERGENT-ARG
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -global-isel=0 %t/divergent-call.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=DIVERGENT-CALL
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -global-isel=0 %t/escape.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=ESCAPE
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -global-isel=0 %t/definition.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=DEFINITION
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -global-isel=0 %t/budget.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=BUDGET
++
++; VERSION: unsupported contract version (expected 1)
++; OVERLAP: overlapping argument register bindings
++; WIDTH: register width must match a 32/64-bit scalar argument or result
++; RESERVED: s[30:39] are reserved for call state
++; EXTENT: register use exceeds declared resource extent
++; PRIVATE: version 1 forbids private memory
++; FULLWAVE: caller must explicitly assert amdgpu-asm-full-wave-calls=true
++; DIVERGENT-ARG: divergent argument 0 cannot bind to an SGPR
++; DIVERGENT-CALL: call is controlled by a divergent branch
++; ESCAPE: version 1 forbids address escapes, aliases, and signature casts
++; DEFINITION: definitions are unsupported; provide an external assembly object
++; BUDGET: callee register resource extent exceeds caller allocation budget
++
++;--- version.ll
++define amdgpu_kernel void @caller() { ret void }
++declare void @stage() #0
++attributes #0 = { convergent nounwind norecurse "amdgpu-asm-contract"="999" }
++
++;--- overlap.ll
++define amdgpu_kernel void @caller() { ret void }
++declare void @stage(i32, i32) #0
++attributes #0 = { convergent nounwind norecurse "amdgpu-asm-contract"="1" "amdgpu-asm-arg-regs"="s0,s0" "amdgpu-asm-clobbers"="" "amdgpu-asm-vgpr-count"="0" "amdgpu-asm-sgpr-count"="32" "amdgpu-asm-private-bytes"="0" }
++
++;--- width.ll
++define amdgpu_kernel void @caller() { ret void }
++declare void @stage(i64) #0
++attributes #0 = { convergent nounwind norecurse "amdgpu-asm-contract"="1" "amdgpu-asm-arg-regs"="v0" "amdgpu-asm-clobbers"="" "amdgpu-asm-vgpr-count"="2" "amdgpu-asm-sgpr-count"="32" "amdgpu-asm-private-bytes"="0" }
++
++;--- reserved.ll
++define amdgpu_kernel void @caller() { ret void }
++declare void @stage() #0
++attributes #0 = { convergent nounwind norecurse "amdgpu-asm-contract"="1" "amdgpu-asm-arg-regs"="" "amdgpu-asm-clobbers"="s30" "amdgpu-asm-vgpr-count"="0" "amdgpu-asm-sgpr-count"="32" "amdgpu-asm-private-bytes"="0" }
++
++;--- extent.ll
++define amdgpu_kernel void @caller() { ret void }
++declare void @stage() #0
++attributes #0 = { convergent nounwind norecurse "amdgpu-asm-contract"="1" "amdgpu-asm-arg-regs"="" "amdgpu-asm-clobbers"="v64" "amdgpu-asm-vgpr-count"="64" "amdgpu-asm-sgpr-count"="32" "amdgpu-asm-private-bytes"="0" }
++
++;--- private.ll
++define amdgpu_kernel void @caller() { ret void }
++declare void @stage() #0
++attributes #0 = { convergent nounwind norecurse "amdgpu-asm-contract"="1" "amdgpu-asm-arg-regs"="" "amdgpu-asm-clobbers"="" "amdgpu-asm-vgpr-count"="0" "amdgpu-asm-sgpr-count"="32" "amdgpu-asm-private-bytes"="4" }
++
++;--- fullwave.ll
++define amdgpu_kernel void @caller() {
++  call void @stage()
++  ret void
++}
++declare void @stage() #0
++attributes #0 = { convergent nounwind norecurse "amdgpu-asm-contract"="1" "amdgpu-asm-arg-regs"="" "amdgpu-asm-clobbers"="" "amdgpu-asm-vgpr-count"="0" "amdgpu-asm-sgpr-count"="32" "amdgpu-asm-private-bytes"="0" }
++
++;--- budget.ll
++define amdgpu_kernel void @caller() #1 {
++  call void @stage()
++  ret void
++}
++declare void @stage() #0
++attributes #0 = { convergent nounwind norecurse "amdgpu-asm-contract"="1" "amdgpu-asm-arg-regs"="" "amdgpu-asm-clobbers"="v95" "amdgpu-asm-vgpr-count"="96" "amdgpu-asm-sgpr-count"="32" "amdgpu-asm-private-bytes"="0" }
++attributes #1 = { "amdgpu-asm-full-wave-calls"="true" "amdgpu-num-vgpr"="64" }
++
++;--- divergent-arg.ll
++define amdgpu_kernel void @caller() #1 {
++  %tid = call i32 @llvm.amdgcn.workitem.id.x()
++  call void @stage(i32 %tid)
++  ret void
++}
++declare i32 @llvm.amdgcn.workitem.id.x()
++declare void @stage(i32) #0
++attributes #0 = { convergent nounwind norecurse "amdgpu-asm-contract"="1" "amdgpu-asm-arg-regs"="s0" "amdgpu-asm-clobbers"="" "amdgpu-asm-vgpr-count"="0" "amdgpu-asm-sgpr-count"="32" "amdgpu-asm-private-bytes"="0" }
++attributes #1 = { "amdgpu-asm-full-wave-calls"="true" }
++
++;--- divergent-call.ll
++define amdgpu_kernel void @caller() #1 {
++entry:
++  %tid = call i32 @llvm.amdgcn.workitem.id.x()
++  %take = icmp ult i32 %tid, 16
++  br i1 %take, label %partial, label %exit
++partial:
++  call void @stage()
++  br label %exit
++exit:
++  ret void
++}
++declare i32 @llvm.amdgcn.workitem.id.x()
++declare void @stage() #0
++attributes #0 = { convergent nounwind norecurse "amdgpu-asm-contract"="1" "amdgpu-asm-arg-regs"="" "amdgpu-asm-clobbers"="" "amdgpu-asm-vgpr-count"="0" "amdgpu-asm-sgpr-count"="32" "amdgpu-asm-private-bytes"="0" }
++attributes #1 = { "amdgpu-asm-full-wave-calls"="true" }
++
++;--- escape.ll
++@address = global ptr @stage
++define amdgpu_kernel void @caller() { ret void }
++declare void @stage() #0
++attributes #0 = { convergent nounwind norecurse "amdgpu-asm-contract"="1" "amdgpu-asm-arg-regs"="" "amdgpu-asm-clobbers"="" "amdgpu-asm-vgpr-count"="0" "amdgpu-asm-sgpr-count"="32" "amdgpu-asm-private-bytes"="0" }
++
++;--- definition.ll
++define void @stage() #0 { ret void }
++attributes #0 = { convergent nounwind norecurse "amdgpu-asm-contract"="1" "amdgpu-asm-arg-regs"="" "amdgpu-asm-clobbers"="" "amdgpu-asm-vgpr-count"="0" "amdgpu-asm-sgpr-count"="32" "amdgpu-asm-private-bytes"="0" }
+diff --git a/llvm/test/CodeGen/AMDGPU/asm-call-contract.ll b/llvm/test/CodeGen/AMDGPU/asm-call-contract.ll
+new file mode 100644
+index 000000000000..49780a5396ef
+--- /dev/null
++++ b/llvm/test/CodeGen/AMDGPU/asm-call-contract.ll
+@@ -0,0 +1,75 @@
++; RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -mattr=+wavefrontsize32 -global-isel=0 -verify-machineinstrs < %s | FileCheck %s
++; RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -mattr=+wavefrontsize32 -global-isel=0 -stop-after=finalize-isel < %s | FileCheck %s --check-prefixes=MIR,MASK
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -mattr=+wavefrontsize32 -global-isel=1 < %s 2>&1 | FileCheck %s --check-prefix=GISEL
++
++; A real device call, with no default ABI argument record and no wrapper. The
++; lane-dependent value and global address remain live across the destructive
++; assembly call. Resource extents include the callee's highest physical indices.
++
++; CHECK-LABEL: caller:
++; CHECK: s_mov_b32 s2, 7
++; CHECK: s_swap_pc_i64 s[30:31]
++; CHECK: .amdhsa_next_free_vgpr 96
++; CHECK: .amdhsa_next_free_sgpr 66
++; MIR-LABEL: name: caller
++; MIR: $sgpr0 = COPY
++; MIR: $sgpr1 = COPY
++; MIR: $vgpr0 = COPY
++; MIR: $vgpr1 = COPY
++; MIR: $vgpr2 = COPY
++; MIR: $vgpr3 = COPY
++; MIR: $sgpr2 = COPY
++; MIR: SI_CALL
++; MASK-SAME: CustomRegMask(
++; MASK-NOT: $src_scc,
++; MASK-NOT: $sgpr4,
++; MASK-NOT: $sgpr4_sgpr5,
++; MASK-NOT: $vgpr4,
++; MASK-NOT: $vgpr64,
++; MASK-NOT: $vgpr63_vgpr64,
++; MASK: implicit $sgpr0
++; MIR: COPY $vgpr4
++; GISEL: AMDGPU ASM contract: GlobalISel is not supported; use -global-isel=0
++define amdgpu_kernel void @caller(ptr addrspace(1) %output) #0 {
++entry:
++  %bx = call i32 @llvm.amdgcn.workgroup.id.x()
++  %by = call i32 @llvm.amdgcn.workgroup.id.y()
++  %tx = call i32 @llvm.amdgcn.workitem.id.x()
++  %ty = call i32 @llvm.amdgcn.workitem.id.y()
++  %address = ptrtoint ptr addrspace(1) %output to i64
++  %saved = mul i32 %tx, 13
++  %result = call i32 @stage(i32 %bx, i32 %by, i64 %address, i32 %tx, i32 %ty, i32 7)
++  %sum = add i32 %result, %saved
++  %slot = getelementptr i32, ptr addrspace(1) %output, i32 %tx
++  store i32 %sum, ptr addrspace(1) %slot, align 4
++  ret void
++}
++
++; Fixed 64-bit scalar input and 64-bit vector return are mapped after ordinary
++; calling-convention type splitting. The return tuple is a definition even if
++; the supplier's explicit clobber list is empty.
++; CHECK-LABEL: caller64:
++; CHECK: s_swap_pc_i64 s[30:31]
++; MIR-LABEL: name: caller64
++; MIR: $sgpr0 = COPY
++; MIR: $sgpr1 = COPY
++; MIR: SI_CALL
++; MIR: COPY $vgpr8
++; MIR: COPY $vgpr9
++define amdgpu_kernel void @caller64(ptr addrspace(1) %output) #0 {
++  %address = ptrtoint ptr addrspace(1) %output to i64
++  %result = call i64 @stage64(i64 %address)
++  store i64 %result, ptr addrspace(1) %output, align 8
++  ret void
++}
++
++declare i32 @stage(i32, i32, i64, i32, i32, i32) #1
++declare i64 @stage64(i64) #2
++declare i32 @llvm.amdgcn.workgroup.id.x()
++declare i32 @llvm.amdgcn.workgroup.id.y()
++declare i32 @llvm.amdgcn.workitem.id.x()
++declare i32 @llvm.amdgcn.workitem.id.y()
++
++attributes #0 = { "amdgpu-flat-work-group-size"="256,256" "amdgpu-asm-full-wave-calls"="true" }
++attributes #1 = { convergent nounwind norecurse "amdgpu-asm-contract"="1" "amdgpu-asm-arg-regs"="s0,s1,v[0:1],v2,v3,s2" "amdgpu-asm-result-reg"="v4" "amdgpu-asm-clobbers"="s[4:6],s40,s48,s63,v[4:9],v64,v72,v95,scc" "amdgpu-asm-vgpr-count"="96" "amdgpu-asm-sgpr-count"="64" "amdgpu-asm-private-bytes"="0" }
++attributes #2 = { convergent nounwind norecurse "amdgpu-asm-contract"="1" "amdgpu-asm-arg-regs"="s[0:1]" "amdgpu-asm-result-reg"="v[8:9]" "amdgpu-asm-clobbers"="" "amdgpu-asm-vgpr-count"="10" "amdgpu-asm-sgpr-count"="32" "amdgpu-asm-private-bytes"="0" }
+diff --git a/llvm/test/CodeGen/AMDGPU/asm-contract-no-spill.ll b/llvm/test/CodeGen/AMDGPU/asm-contract-no-spill.ll
+new file mode 100644
+index 000000000000..855d8b88eb86
+--- /dev/null
++++ b/llvm/test/CodeGen/AMDGPU/asm-contract-no-spill.ll
+@@ -0,0 +1,131 @@
++; RUN: split-file %s %t
++; RUN: llc -mtriple=amdgpu12.50-amd-amdhsa %t/ok.ll -o - -amdgpu-asm-contract-report=%t/ok.json | FileCheck %s --check-prefix=OK
++; RUN: FileCheck %s --check-prefix=REPORT < %t/ok.json
++; RUN: not llc -mtriple=amdgpu12.50-amd-amdhsa %t/private.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=PRIVATE
++; RUN: not llc -mtriple=amdgpu12.50-amd-amdhsa %t/csr.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=CSR
++; RUN: not llc -mtriple=amdgpu12.50-amd-amdhsa %t/opaque.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPAQUE
++; RUN: not llc -mtriple=amdgpu12.50-amd-amdhsa %t/external.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=EXTERNAL
++; RUN: not llc -mtriple=amdgpu12.50-amd-amdhsa %t/indirect.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=INDIRECT
++; RUN: not llc -mtriple=amdgpu12.50-amd-amdhsa %t/recursive.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=RECURSIVE
++; RUN: not llc -mtriple=amdgpu9.00-amd-amdhsa %t/spill.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=SPILL
++; RUN: not llc -mtriple=amdgpu12.50-amd-amdhsa %t/lane.ll -o /dev/null -amdgpu-asm-contract-report=%t/lane.json 2>&1 | FileCheck %s --check-prefix=LANE
++; RUN: FileCheck %s --check-prefix=LANEJSON < %t/lane.json
++; RUN: llc -mtriple=amdgpu12.50-amd-amdhsa %t/disabled.ll -o /dev/null
++
++; OK-LABEL: good:
++; OK: .amdhsa_private_segment_fixed_size 0
++; REPORT: "external_object_audit_required": true
++; REPORT: "function": "good"
++; REPORT: "lowered_sgpr_spill_dwords": 0
++; REPORT: "lowered_vgpr_spill_dwords": 0
++; REPORT: "no_gpr_spill": true
++; REPORT: "no_private_memory": true
++; REPORT: "private_access_instructions": 0
++; REPORT: "private_frame_bytes": 0
++; REPORT: "strict_policy_status": "checked"
++; PRIVATE: error: {{.*}}amdgpu-no-private-memory violated:
++; PRIVATE-SAME: instruction(s) may access private memory
++; CSR: error: {{.*}}save_v40{{.*}}amdgpu-no-gpr-spill violated:
++; OPAQUE: error: {{.*}}cannot verify nonempty inline assembly
++; EXTERNAL: error: {{.*}}requires an ASM contract for external callee 'unknown'
++; INDIRECT: error: {{.*}}cannot verify an indirect call
++; RECURSIVE: error: {{.*}}cannot verify recursive calls
++; SPILL: error: {{.*}}amdgpu-no-gpr-spill violated: generated GPR spill
++; LANE: error: {{.*}}amdgpu-no-gpr-spill violated:
++; LANE-SAME: SGPR spill dwords=1, VGPR spill dwords=0
++; LANEJSON: "lowered_sgpr_spill_dwords": 1
++; LANEJSON: "lowered_vgpr_spill_dwords": 0
++; LANEJSON: "private_access_instructions": 0
++; LANEJSON: "private_frame_bytes": 0
++; LANEJSON: "strict_policy_status": "rejected"
++
++;--- ok.ll
++define amdgpu_kernel void @good(ptr addrspace(1) %out) #0 {
++  %id = call i32 @llvm.amdgcn.workitem.id.x()
++  %p = getelementptr i32, ptr addrspace(1) %out, i32 %id
++  call void asm sideeffect "", "~{v4}"()
++  store i32 %id, ptr addrspace(1) %p
++  ret void
++}
++declare i32 @llvm.amdgcn.workitem.id.x()
++attributes #0 = { nounwind "amdgpu-no-gpr-spill" "amdgpu-no-private-memory" }
++
++;--- private.ll
++; A private access is forbidden even without an alloca or spill frame.
++define amdgpu_kernel void @private_argument(ptr addrspace(5) %p,
++                                            ptr addrspace(1) %out) #0 {
++  %v = load volatile i32, ptr addrspace(5) %p
++  store i32 %v, ptr addrspace(1) %out
++  ret void
++}
++attributes #0 = { nounwind "amdgpu-no-private-memory" }
++
++;--- csr.ll
++; The root's policy is inherited by a definition without a strict attribute.
++; Default-ABI preservation is prohibited even if the normal spill count is 0.
++define amdgpu_kernel void @root() #0 {
++  call void @save_v40()
++  ret void
++}
++define void @save_v40() #1 {
++  call void asm sideeffect "", "~{v40}"()
++  ret void
++}
++attributes #0 = { nounwind "amdgpu-no-gpr-spill" "amdgpu-no-private-memory" }
++attributes #1 = { nounwind noinline }
++
++;--- opaque.ll
++define amdgpu_kernel void @opaque() #0 {
++  call void asm sideeffect "s_nop 0", ""()
++  ret void
++}
++attributes #0 = { nounwind "amdgpu-no-private-memory" }
++
++;--- external.ll
++declare void @unknown()
++define amdgpu_kernel void @external() #0 {
++  call void @unknown()
++  ret void
++}
++attributes #0 = { nounwind "amdgpu-no-private-memory" }
++
++;--- indirect.ll
++define amdgpu_kernel void @indirect(ptr %fp) #0 {
++  call void %fp()
++  ret void
++}
++attributes #0 = { nounwind "amdgpu-no-private-memory" }
++
++;--- recursive.ll
++define void @recursive() #0 {
++  call void @recursive()
++  ret void
++}
++attributes #0 = { nounwind noinline "amdgpu-no-private-memory" }
++
++;--- spill.ll
++define amdgpu_kernel void @vgpr_spill(ptr addrspace(1) %p) #0 {
++  %tid = call i32 @llvm.amdgcn.workitem.id.x()
++  %gep = getelementptr inbounds <32 x float>, ptr addrspace(1) %p, i32 %tid
++  %v = load volatile <32 x float>, ptr addrspace(1) %gep
++  store volatile <32 x float> %v, ptr addrspace(1) %p
++  ret void
++}
++declare i32 @llvm.amdgcn.workitem.id.x()
++attributes #0 = { nounwind "amdgpu-num-vgpr"="10" "amdgpu-no-gpr-spill" }
++
++;--- lane.ll
++; SGPR-to-VGPR-lane spilling must fail even though private usage is zero.
++define amdgpu_kernel void @scalar_lane() #0 {
++  %a = call i32 asm sideeffect "", "=s"()
++  call void asm sideeffect "", "~{s[0:15]},~{s[16:31]},~{s[32:47]},~{s[48:63]},~{s[64:79]},~{s[80:95]},~{s[96:103]},~{s[104:105]},~{m0},~{vcc}"()
++  call void asm sideeffect "", "s"(i32 %a)
++  ret void
++}
++attributes #0 = { nounwind "amdgpu-no-gpr-spill" }
++
++;--- disabled.ll
++define void @ordinary_abi_save() noinline {
++  call void asm sideeffect "", "~{v40}"()
++  ret void
++}

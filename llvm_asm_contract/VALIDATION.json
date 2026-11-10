@@ -1,0 +1,71 @@
+{
+  "status": "OFFLINE_PASS",
+  "started_unix": 1794310069.9135315,
+  "gpu_execution": "NOT_RUN",
+  "llvm_bin": "/home/feifei/repo/llvm-project-asm-contract/build-contract/bin",
+  "source": "/home/feifei/repo/llvm-project-asm-contract",
+  "llvm_regression_files_passed": 16,
+  "demo": {
+    "metadata": {
+      "vgpr_count": 96,
+      "sgpr_count": 66,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0
+    },
+    "device_calls": 2,
+    "strict_policy_status": "checked",
+    "kernel": "/home/feifei/repo/ATOM/llvm_asm_contract/build/demo/kernel.co",
+    "kernel_sha256": "c1b537855bfad00d072c6217865633c984af7772dffc36c01289886ccc55d5fc"
+  },
+  "flydsl": {
+    "metadata": {
+      "vgpr_count": 96,
+      "sgpr_count": 66,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0
+    },
+    "device_calls": 2,
+    "strict_policy_status": "checked",
+    "kernel": "/home/feifei/repo/ATOM/llvm_asm_contract/build/flydsl/kernel.co",
+    "kernel_sha256": "9209c8698cacf717c7fbf586903815cd72a41c1be93a5692817735efde76b4ac"
+  },
+  "host_launcher": "BUILT",
+  "llc_sha256": "3c69458f2b24ed38300af02b4cc175b7bf73c8e861e910413f6eba51623eb7e7",
+  "llvm_base": "2006b625d467c5082c0ff68b8d3aba162082c9c3",
+  "completed_unix": 1794310072.3763115,
+  "patch": {
+    "base_commit": "2006b625d467c5082c0ff68b8d3aba162082c9c3",
+    "patch_sha256": "c319aa97bec8bd6f8e02874f67c2066d299494cc0b8140246c21ce98bef92695",
+    "patch_bytes": 71871,
+    "changed_files": [
+      "llvm/docs/AMDGPUAsmStrictPolicies.rst",
+      "llvm/docs/AMDGPUExternalAsmContract.rst",
+      "llvm/docs/AMDGPUUsage.md",
+      "llvm/lib/Target/AMDGPU/AMDGPUAsmCallContract.cpp",
+      "llvm/lib/Target/AMDGPU/AMDGPUAsmCallContract.h",
+      "llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.cpp",
+      "llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.h",
+      "llvm/lib/Target/AMDGPU/AMDGPUCallLowering.cpp",
+      "llvm/lib/Target/AMDGPU/AMDGPUResourceUsageAnalysis.cpp",
+      "llvm/lib/Target/AMDGPU/CMakeLists.txt",
+      "llvm/lib/Target/AMDGPU/SIISelLowering.cpp",
+      "llvm/test/CodeGen/AMDGPU/asm-call-contract-errors.ll",
+      "llvm/test/CodeGen/AMDGPU/asm-call-contract.ll",
+      "llvm/test/CodeGen/AMDGPU/asm-contract-no-spill.ll"
+    ],
+    "llvm_patch_applied_reverse_check": "PASS",
+    "pristine_forward_apply_and_file_identity": "PASS"
+  },
+  "object_audit_negative_tests_passed": 6,
+  "gpu_note": "Local ROCm enumerates gfx1100; gfx1250 kernels were not executed.",
+  "logs_sha256": {
+    "flydsl-version.log": "f62184cee8787f2f6941c82041a5725d4edc9aa293ebe5dbf664406e82ec1fe1",
+    "ir-demo.log": "7e5287a3130713989f83126795943b10d1182041c0aedfab081a33670637df89",
+    "host-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "final-run.log": "224a6491961e88ece9dc010c3531d6e38b13f6548724d2e4587dace554101bc6",
+    "existing-call-tests.log": "0e52b5b3678de3e26026913e9c7781c1478a3f5ec2cd789de4057f78fd83ca4a",
+    "flydsl-demo.log": "eab5a7af9f4600449fca2b9cb28afa6ad6ca9bd8933ea9cd02395b49d2d33d8e",
+    "object-audit-tests.log": "49512156d1896ccc45b2ce0975f57551b54a32bbc630ba56e29f6153590a65e9",
+    "llvm-tests.log": "b00898ba0cbf6d024e9b83d4984258a29395f3f056a9fb266f916473ad41adda"
+  }
+}

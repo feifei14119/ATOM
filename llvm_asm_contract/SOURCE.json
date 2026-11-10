@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/ROCm/llvm-project.git",
+  "upstream_branch": "amd-staging",
+  "base_commit": "2006b625d467c5082c0ff68b8d3aba162082c9c3",
+  "development_branch": "codex/amdgpu-external-asm-contract",
+  "llvm_major": 24,
+  "target": "gfx1250",
+  "wavefront_size": 32
+}

@@ -1,0 +1,23 @@
+{
+  "base_commit": "2006b625d467c5082c0ff68b8d3aba162082c9c3",
+  "patch_sha256": "c319aa97bec8bd6f8e02874f67c2066d299494cc0b8140246c21ce98bef92695",
+  "patch_bytes": 71871,
+  "changed_files": [
+    "llvm/docs/AMDGPUAsmStrictPolicies.rst",
+    "llvm/docs/AMDGPUExternalAsmContract.rst",
+    "llvm/docs/AMDGPUUsage.md",
+    "llvm/lib/Target/AMDGPU/AMDGPUAsmCallContract.cpp",
+    "llvm/lib/Target/AMDGPU/AMDGPUAsmCallContract.h",
+    "llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.cpp",
+    "llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.h",
+    "llvm/lib/Target/AMDGPU/AMDGPUCallLowering.cpp",
+    "llvm/lib/Target/AMDGPU/AMDGPUResourceUsageAnalysis.cpp",
+    "llvm/lib/Target/AMDGPU/CMakeLists.txt",
+    "llvm/lib/Target/AMDGPU/SIISelLowering.cpp",
+    "llvm/test/CodeGen/AMDGPU/asm-call-contract-errors.ll",
+    "llvm/test/CodeGen/AMDGPU/asm-call-contract.ll",
+    "llvm/test/CodeGen/AMDGPU/asm-contract-no-spill.ll"
+  ],
+  "llvm_patch_applied_reverse_check": "PASS",
+  "pristine_forward_apply_and_file_identity": "PASS"
+}

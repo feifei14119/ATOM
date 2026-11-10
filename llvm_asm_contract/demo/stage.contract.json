@@ -1,0 +1,24 @@
+{
+  "schema": "experimental.amdgpu.external_asm.v1",
+  "symbol": "contract_stage",
+  "target": "gfx1250",
+  "wavefront_size": 32,
+  "entry_exec": "full_wave",
+  "preserved_state": ["exec", "mode", "m0", "ttmp", "vgpr_bank_state"],
+  "arguments": [
+    {"name": "block_x", "type": "uint32", "register": "s0", "uniform": true},
+    {"name": "block_y", "type": "uint32", "register": "s1", "uniform": true},
+    {"name": "record_address", "type": "uint64", "register": "v[0:1]"},
+    {"name": "thread_x", "type": "uint32", "register": "v2"},
+    {"name": "thread_y", "type": "uint32", "register": "v3"},
+    {"name": "factor", "type": "uint32", "register": "s2", "uniform": true}
+  ],
+  "result": {"type": "uint32", "register": "v4"},
+  "return_pc": "s[30:31]",
+  "clobbers": ["s[4:6]", "s40", "s48", "s63", "v[4:9]", "v64", "v72", "v95", "scc"],
+  "uses": ["s[0:6]", "s[30:31]", "s40", "s48", "s63", "v[0:9]", "v64", "v72", "v95"],
+  "resources": {"vgpr_count": 96, "sgpr_count": 64, "private_bytes": 0, "lds_bytes": 0},
+  "memory": "read_write_global",
+  "leaf": true,
+  "audit_scope": "restricted linear instruction whitelist; no claim for arbitrary opaque assembly"
+}

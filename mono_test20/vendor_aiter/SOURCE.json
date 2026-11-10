@@ -1,0 +1,14 @@
+{
+  "buffer_ops.py": {
+    "source": "/home/feifei/repo/aiter/aiter/ops/flydsl/kernels/buffer_ops.py",
+    "sha256": "da0a5d5b4e5b511e47ce3d1b4ddea3c4510108ab55e9b8b84e967c5bb18d8171"
+  },
+  "dpp_utils.py": {
+    "source": "/home/feifei/repo/aiter/aiter/ops/flydsl/kernels/dpp_utils.py",
+    "sha256": "e230529d0d2aea21a6c09731459c2bb2d61112b46fc6df537f082577237edab8"
+  },
+  "kernels_common.py": {
+    "source": "/home/feifei/repo/aiter/aiter/ops/flydsl/kernels/kernels_common.py",
+    "sha256": "7e78afb533d4e4bde1a34f73416404a94c5688891775cb0166ad61cf322a673b"
+  }
+}

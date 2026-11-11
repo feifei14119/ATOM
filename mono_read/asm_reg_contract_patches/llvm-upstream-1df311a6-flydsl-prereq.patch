@@ -1,0 +1,128 @@
+From 2e27f6b7542ff040a8b0895eb9a74c16d950cbdb Mon Sep 17 00:00:00 2001
+From: flydsl <flydsl@local>
+Date: Tue, 10 Nov 2026 11:42:52 +0000
+Subject: [PATCH] FlyDSL required LLVM patches (rocdl-lld-argv0,
+ rocdl-waves-per-eu-range, xnack-any-codegen-override)
+
+---
+ llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp    | 13 +++++++++++++
+ mlir/include/mlir/Dialect/LLVMIR/ROCDLDialect.td  |  2 +-
+ mlir/lib/Target/LLVM/ROCDL/Target.cpp             |  2 +-
+ .../Dialect/ROCDL/ROCDLToLLVMIRTranslation.cpp    | 15 +++++++++------
+ mlir/test/Target/LLVMIR/rocdl.mlir                |  8 ++++++++
+ 5 files changed, 32 insertions(+), 8 deletions(-)
+
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp b/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp
+index 9176adff0..50f5a575c 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp
++++ b/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp
+@@ -15,6 +15,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "AMDGPUTargetMachine.h"
++#include "llvm/Support/Process.h"
+ #include "AMDGPU.h"
+ #include "AMDGPUAliasAnalysis.h"
+ #include "AMDGPUAsmPrinter.h"
+@@ -1347,6 +1348,18 @@ GCNTargetMachine::getSubtargetImpl(const Function &F) const {
+ 
+   using AMDGPU::TargetIDSetting;
+   TargetIDSetting Xnack = getTargetIDSettingFromModuleFlag(M, "amdgpu.xnack");
++  // Experiment only: hardware XNACK is disabled. Override the per-function
++  // machine subtarget for Any while retaining the module/global MC target
++  // identity as Any. The asm printer therefore still serializes Any ELF flags
++  // and metadata. Explicit module flag settings retain their normal behavior.
++  if (GPU == "gfx1250" && Xnack == TargetIDSetting::Any) {
++    if (auto Mode = sys::Process::GetEnv("LLVM_GFX1250_ANY_XNACK_CODEGEN")) {
++      if (*Mode != "0" && *Mode != "1")
++        report_fatal_error("LLVM_GFX1250_ANY_XNACK_CODEGEN must be 0 or 1");
++      Xnack = *Mode == "1" ? TargetIDSetting::On : TargetIDSetting::Off;
++    }
++  }
++
+   TargetIDSetting SramEcc =
+       getTargetIDSettingFromModuleFlag(M, "amdgpu.sramecc");
+ 
+diff --git a/mlir/include/mlir/Dialect/LLVMIR/ROCDLDialect.td b/mlir/include/mlir/Dialect/LLVMIR/ROCDLDialect.td
+index 0807cf8cf..eca64b9a3 100644
+--- a/mlir/include/mlir/Dialect/LLVMIR/ROCDLDialect.td
++++ b/mlir/include/mlir/Dialect/LLVMIR/ROCDLDialect.td
+@@ -149,7 +149,7 @@ def ROCDL_Dialect : Dialect {
+      "::mlir::DenseI32ArrayAttr":$reqd_work_group_size,
+      "::mlir::StringAttr":$flat_work_group_size,
+      "::mlir::IntegerAttr":$max_flat_work_group_size,
+-     "::mlir::IntegerAttr":$waves_per_eu,
++     "::mlir::StringAttr":$waves_per_eu,
+      "::mlir::BoolAttr":$unsafe_fp_atomics,
+      // Correspond to LLVM metadata of the same name
+      "::mlir::UnitAttr":$last_use,
+diff --git a/mlir/lib/Target/LLVM/ROCDL/Target.cpp b/mlir/lib/Target/LLVM/ROCDL/Target.cpp
+index 56bf2a030..9d9cb9035 100644
+--- a/mlir/lib/Target/LLVM/ROCDL/Target.cpp
++++ b/mlir/lib/Target/LLVM/ROCDL/Target.cpp
+@@ -363,7 +363,7 @@ mlir::ROCDL::linkObjectCode(ArrayRef<char> objectCode, StringRef lldPath,
+ 
+   int lldResult = llvm::sys::ExecuteAndWait(
+       lldPath,
+-      {"ld.lld", "-shared", tempIsaBinaryFilename, "-o", tempHsacoFilename});
++      {lldPath, "-shared", tempIsaBinaryFilename, "-o", tempHsacoFilename});
+   if (lldResult != 0)
+     return emitError() << "lld invocation failed";
+ 
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.cpp
+index 42393218f..4ecf70895 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.cpp
+@@ -103,16 +103,19 @@ public:
+       if (!func)
+         return op->emitOpError(Twine(attribute.getName()) +
+                                " is only supported on `llvm.func` operations");
+-      auto value = dyn_cast<IntegerAttr>(attribute.getValue());
+-      if (!value)
+-        return op->emitOpError(Twine(attribute.getName()) +
+-                               " must be an integer");
+ 
+       llvm::Function *llvmFunc =
+           moduleTranslation.lookupFunction(func.getName());
+       llvm::SmallString<8> llvmAttrValue;
+-      llvm::raw_svector_ostream attrValueStream(llvmAttrValue);
+-      attrValueStream << value.getInt();
++      if (auto strValue = dyn_cast<StringAttr>(attribute.getValue())) {
++        llvmAttrValue.append(strValue.getValue());
++      } else if (auto intValue = dyn_cast<IntegerAttr>(attribute.getValue())) {
++        llvm::raw_svector_ostream attrValueStream(llvmAttrValue);
++        attrValueStream << intValue.getInt();
++      } else {
++        return op->emitOpError(Twine(attribute.getName()) +
++                               " must be a string or an integer");
++      }
+       llvmFunc->addFnAttr("amdgpu-waves-per-eu", llvmAttrValue);
+     }
+     if (dialect->getFlatWorkGroupSizeAttrHelper().getName() ==
+diff --git a/mlir/test/Target/LLVMIR/rocdl.mlir b/mlir/test/Target/LLVMIR/rocdl.mlir
+index c6c4d1730..260c328a4 100644
+--- a/mlir/test/Target/LLVMIR/rocdl.mlir
++++ b/mlir/test/Target/LLVMIR/rocdl.mlir
+@@ -150,6 +150,13 @@ llvm.func @kernel_func_waves_per_eu()
+   llvm.return
+ }
+ 
++llvm.func @kernel_func_waves_per_eu_range()
++    attributes {rocdl.kernel, rocdl.waves_per_eu = "1,1"} {
++  // CHECK-LABEL: amdgpu_kernel void @kernel_func_waves_per_eu_range()
++  // CHECK: #[[$KERNEL_WAVES_PER_EU_RANGE_ATTR:[0-9]+]]
++  llvm.return
++}
++
+ llvm.func @kernel_func_unsafe_fp_atomics()
+     attributes {rocdl.kernel, rocdl.unsafe_fp_atomics = true} {
+   // CHECK-LABEL: amdgpu_kernel void @kernel_func_unsafe_fp_atomics()
+@@ -2252,4 +2259,5 @@ llvm.func @rocdl_dot_fp8_family(%i32: i32, %f32: f32) -> f32 {
+ // CHECK-DAG: ![[$REQD_WORK_GROUP_SIZE]] = !{i32 16, i32 4, i32 2}
+ // CHECK-DAG: ![[$REQD_BLOCK_SIZE]] = !{i32 8, i32 4, i32 2}
+ // CHECK-DAG: attributes #[[$KERNEL_WAVES_PER_EU_ATTR]] = { "amdgpu-flat-work-group-size"="1,256" "amdgpu-waves-per-eu"="2" "uniform-work-group-size" }
++// CHECK-DAG: attributes #[[$KERNEL_WAVES_PER_EU_RANGE_ATTR]] = { "amdgpu-flat-work-group-size"="1,256" "amdgpu-waves-per-eu"="1,1" "uniform-work-group-size" }
+ // CHECK-DAG: attributes #[[$KERNEL_UNSAFE_FP_ATOMICS_ATTR]] = { "amdgpu-flat-work-group-size"="1,256" "amdgpu-unsafe-fp-atomics"="true" "uniform-work-group-size" }
+-- 
+2.43.0
+

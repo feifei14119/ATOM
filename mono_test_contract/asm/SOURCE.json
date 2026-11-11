@@ -1,0 +1,8 @@
+{
+  "original": "mono_read/mono_test1/atom/dq_convert.original.s, via mono_test10",
+  "original_sha256": "4050f8e1eacf2463c98adeb8f2aeee2ca93e2792de3a43e58088cbd36a05a711",
+  "adapted_instructions": "identical to mono_test10 inline fragment; only enclosing function changed",
+  "wrapping": "C++ standard ABI noinline+convergent function with fixed-input/clobber inline asm",
+  "linking": "FlyDSL ffi + link_extern with real LLVM bitcode",
+  "validation": "Whole Mono compiled and gfx1250 GPU A/B tests PASS (ROCm 7.16, AMD clang 23.0.0git)"
+}

@@ -1,0 +1,15 @@
+# Register contract for the supplier dq_convert fragment (same .s as mono_test00).
+# Packed by build_contract.py with flydsl.compiler.asm_contract.
+name: dq_convert
+source: dq_convert.inline.s
+symbol: mono_dq_convert_inline_fragment
+target: gfx1250
+align: 64
+params:
+  - {name: args, reg: "s[0:1]", type: uint64}   # uniform GPU-global DqConvertArgs*
+  - {name: lane, reg: v0,       type: uint32}   # lane 0..31
+  - {name: wave, reg: s24,      type: uint32}   # wave index in the CTA
+# Omitted clobbers = exactly the registers the fragment writes (from the
+# machine-code footprint). EXEC and floating-point MODE are restored inside.
+preserves: [exec, mode]
+memory: true

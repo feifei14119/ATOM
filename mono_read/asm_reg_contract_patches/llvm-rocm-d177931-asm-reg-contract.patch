@@ -1,0 +1,1807 @@
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPU.h b/llvm/lib/Target/AMDGPU/AMDGPU.h
+index c6dd1dbb6..a5894bd4b 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPU.h
++++ b/llvm/lib/Target/AMDGPU/AMDGPU.h
+@@ -102,6 +102,8 @@ public:
+ void initializeAMDGPUDAGToDAGISelLegacyPass(PassRegistry &);
+ 
+ void initializeAMDGPUAlwaysInlinePass(PassRegistry&);
++void initializeAMDGPUExpandContractCallsPass(PassRegistry &);
++void initializeAMDGPUContractReportPass(PassRegistry &);
+ 
+ void initializeAMDGPUAsmPrinterPass(PassRegistry &);
+ 
+@@ -305,6 +307,8 @@ struct AMDGPUInsertDelayAluPass
+ Pass *createAMDGPUStructurizeCFGPass();
+ FunctionPass *createAMDGPUISelDag(TargetMachine &TM, CodeGenOptLevel OptLevel);
+ ModulePass *createAMDGPUAlwaysInlinePass(bool GlobalOpt = true);
++ModulePass *createAMDGPUExpandContractCallsPass();
++extern char &AMDGPUContractReportID;
+ 
+ struct AMDGPUAlwaysInlinePass : OptionalPassInfoMixin<AMDGPUAlwaysInlinePass> {
+   AMDGPUAlwaysInlinePass(bool GlobalOpt = true) : GlobalOpt(GlobalOpt) {}
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.cpp b/llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.cpp
+index d32cdb6d9..85da6a11f 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.cpp
++++ b/llvm/lib/Target/AMDGPU/AMDGPUAsmPrinter.cpp
+@@ -1896,6 +1896,21 @@ bool AMDGPUAsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
+   // TODO: Should be able to support other operand types like globals.
+   const MachineOperand &MO = MI->getOperand(OpNo);
+   if (MO.isReg()) {
++    const SIRegisterInfo &TRI =
++        *MF->getSubtarget<GCNSubtarget>().getRegisterInfo();
++    MCRegister Reg = MO.getReg().asMCReg();
++    const unsigned Enc = TRI.getEncodingValue(Reg);
++    const unsigned HighestVGPR =
++        (Enc & AMDGPU::HWEncoding::REG_IDX_MASK) +
++        divideCeil(TRI.getRegSizeInBits(*TRI.getPhysRegBaseClass(Reg)), 32) - 1;
++    if ((Enc & AMDGPU::HWEncoding::IS_VGPR) && HighestVGPR >= 256)
++      MF->getFunction().getContext().diagnose(DiagnosticInfoInlineAsm(
++          /*LocCookie=*/0,
++          "inline asm operand is assigned to v" + Twine(HighestVGPR) +
++              ", which cannot be written in assembly text (registers above "
++              "v255 are only addressable through s_set_vgpr_msb); use it only "
++              "as a fixed-register operand of pre-encoded code",
++          DS_Error));
+     AMDGPUInstPrinter::printRegOperand(MO.getReg(), O,
+                                        *MF->getSubtarget().getRegisterInfo());
+     return false;
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUContract.cpp b/llvm/lib/Target/AMDGPU/AMDGPUContract.cpp
+new file mode 100644
+index 000000000..0b1e4cd38
+--- /dev/null
++++ b/llvm/lib/Target/AMDGPU/AMDGPUContract.cpp
+@@ -0,0 +1,616 @@
++//===- AMDGPUContract.cpp - Register-contract functions -------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++/// \file
++/// Support for register-contract functions: pre-encoded code packaged as an IR
++/// function whose interface is declared by the function itself instead of by
++/// the calling convention.
++///
++/// A contract function carries
++///   "amdgpu-contract"="<name>"                       the contract name,
++///   "amdgpu-contract-clobber"="s[2:23],v[4:511],scc" every register it writes,
++/// and every parameter carries "amdgpu-reg"="<reg>" naming the physical
++/// register the value is passed in. Its body is a single basic block made of
++/// argument conversions, exactly one inline asm call that binds each parameter
++/// to its register and clobbers a subset of the declared footprint, and a ret.
++///
++/// AMDGPUExpandContractCalls (IR) checks the contract and expands every call
++/// in place, so a call costs nothing beyond moving arguments into their
++/// registers: no stack, no saved registers and no s_swap_pc. A call site may be
++/// preceded by a marker `call void asm sideeffect ";@amdgpu-contract-site
++/// <text>", ""()` naming the source location for diagnostics.
++///
++/// AMDGPUContractReport (MIR, after register allocation and before frame
++/// lowering) reports, for every expanded call, which registers stay live
++/// across it, and enforces "amdgpu-spill-policy"="error": any VGPR spill,
++/// stack object or more than "amdgpu-sgpr-lane-spill-max" SGPR lane spills is
++/// a compile error.
++//
++//===----------------------------------------------------------------------===//
++
++#include "AMDGPU.h"
++#include "GCNSubtarget.h"
++#include "MCTargetDesc/AMDGPUInstPrinter.h"
++#include "SIInstrInfo.h"
++#include "SIMachineFunctionInfo.h"
++#include "Utils/AMDGPUBaseInfo.h"
++#include "llvm/ADT/SmallString.h"
++#include "llvm/ADT/StringExtras.h"
++#include "llvm/CodeGen/LivePhysRegs.h"
++#include "llvm/CodeGen/MachineFrameInfo.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/IR/DiagnosticInfo.h"
++#include "llvm/IR/InlineAsm.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/IntrinsicsAMDGPU.h"
++#include "llvm/IR/Module.h"
++#include "llvm/Pass.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/FileSystem.h"
++#include "llvm/Support/JSON.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/Transforms/Utils/ValueMapper.h"
++#include <set>
++
++using namespace llvm;
++
++#define DEBUG_TYPE "amdgpu-contract"
++
++static constexpr StringLiteral ContractAttr = "amdgpu-contract";
++static constexpr StringLiteral ClobberAttr = "amdgpu-contract-clobber";
++static constexpr StringLiteral RegAttr = "amdgpu-reg";
++static constexpr StringLiteral SiteMarker = ";@amdgpu-contract-site ";
++static constexpr StringLiteral AsmHeader = ";@amdgpu-contract ";
++
++static cl::opt<std::string> SpillPolicy(
++    "amdgpu-spill-policy",
++    cl::desc("Default for the amdgpu-spill-policy function attribute: 'allow' "
++             "or 'error' (any VGPR spill or stack object is an error)"),
++    cl::init("allow"));
++
++static cl::opt<unsigned> SGPRLaneSpillMax(
++    "amdgpu-sgpr-lane-spill-max",
++    cl::desc("Default for amdgpu-sgpr-lane-spill-max: SGPRs that may be "
++             "spilled to VGPR lanes under amdgpu-spill-policy=error"),
++    cl::init(0));
++
++static cl::opt<std::string> ContractReportFile(
++    "amdgpu-contract-report",
++    cl::desc("Append a JSON line per function describing contract call sites "
++             "and spills to this file"),
++    cl::init(""));
++
++namespace {
++
++/// A set of register names such as "v12", "s3", "scc".
++using RegNameSet = std::set<std::string>;
++
++/// Parse "s[2:23],v4,scc" (with or without surrounding braces per element).
++bool parseRegList(StringRef List, RegNameSet &Out, std::string &Err) {
++  SmallVector<StringRef, 16> Parts;
++  List.split(Parts, ',', -1, /*KeepEmpty=*/false);
++  for (StringRef P : Parts) {
++    P = P.trim();
++    if (P.consume_front("{") && !P.consume_back("}")) {
++      Err = ("malformed register '" + P + "'").str();
++      return false;
++    }
++    auto [Kind, Idx, NumRegs] = AMDGPU::parseAsmPhysRegName(P);
++    if (Kind == 'v' || Kind == 's') {
++      for (unsigned I = 0; I < NumRegs; ++I)
++        Out.insert((Twine(Kind) + Twine(Idx + I)).str());
++      continue;
++    }
++    if (P.empty() || !all_of(P, [](char C) { return isAlnum(C) || C == '_'; })) {
++      Err = ("malformed register '" + P + "'").str();
++      return false;
++    }
++    Out.insert(P.lower());
++  }
++  return true;
++}
++
++/// Compress a sorted list of indices into "v[0:3],v7".
++std::string formatRegs(char Kind, ArrayRef<unsigned> Idx) {
++  std::string S;
++  raw_string_ostream OS(S);
++  for (size_t I = 0; I < Idx.size();) {
++    size_t J = I;
++    while (J + 1 < Idx.size() && Idx[J + 1] == Idx[J] + 1)
++      ++J;
++    if (!S.empty())
++      OS << ',';
++    if (I == J)
++      OS << Kind << Idx[I];
++    else
++      OS << Kind << '[' << Idx[I] << ':' << Idx[J] << ']';
++    I = J + 1;
++  }
++  return S;
++}
++
++//===----------------------------------------------------------------------===//
++// AMDGPUExpandContractCalls
++//===----------------------------------------------------------------------===//
++
++class AMDGPUExpandContractCalls : public ModulePass {
++public:
++  static char ID;
++  AMDGPUExpandContractCalls() : ModulePass(ID) {}
++  bool runOnModule(Module &M) override;
++  StringRef getPassName() const override {
++    return "AMDGPU Expand Register-Contract Calls";
++  }
++};
++
++void contractError(const Function &F, const Twine &Msg) {
++  F.getContext().diagnose(DiagnosticInfoGeneric(
++      Twine("contract function '") + F.getName() + "': " + Msg, DS_Error));
++}
++
++/// Check the shape of a contract function. Returns its inline asm call.
++CallInst *verifyContract(Function &F) {
++  if (F.isDeclaration()) {
++    contractError(F, "has no body; link the bitcode that defines it");
++    return nullptr;
++  }
++  if (F.size() != 1) {
++    contractError(F, "body must be a single basic block");
++    return nullptr;
++  }
++
++  RegNameSet Footprint;
++  std::string Err;
++  if (!parseRegList(F.getFnAttribute(ClobberAttr).getValueAsString(), Footprint,
++                    Err)) {
++    contractError(F, Twine(ClobberAttr) + ": " + Err);
++    return nullptr;
++  }
++
++  std::multiset<std::string> ParamRegs;
++  for (Argument &A : F.args()) {
++    Attribute R = F.getAttributes().getParamAttr(A.getArgNo(), RegAttr);
++    if (!R.isStringAttribute()) {
++      contractError(F, "parameter " + Twine(A.getArgNo()) + " has no '" +
++                           RegAttr + "' attribute");
++      return nullptr;
++    }
++    ParamRegs.insert(("{" + R.getValueAsString() + "}").str());
++  }
++
++  CallInst *Asm = nullptr;
++  for (Instruction &I : F.getEntryBlock()) {
++    if (isa<ReturnInst>(I) || isa<CastInst>(I) || isa<BinaryOperator>(I) ||
++        isa<ExtractValueInst>(I) || isa<InsertValueInst>(I))
++      continue;
++    if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
++      switch (II->getIntrinsicID()) {
++      case Intrinsic::amdgcn_readfirstlane:
++      case Intrinsic::amdgcn_wave_id:
++      case Intrinsic::amdgcn_workitem_id_x:
++        continue;
++      default:
++        break;
++      }
++    }
++    auto *CI = dyn_cast<CallInst>(&I);
++    if (CI && CI->isInlineAsm() && !Asm) {
++      Asm = CI;
++      continue;
++    }
++    contractError(F, "body may only contain argument conversions, one inline "
++                     "asm call and ret; found: " +
++                         Twine(I.getOpcodeName()));
++    return nullptr;
++  }
++  if (!Asm) {
++    contractError(F, "body has no inline asm call");
++    return nullptr;
++  }
++
++  const InlineAsm *IA = cast<InlineAsm>(Asm->getCalledOperand());
++  std::multiset<std::string> InputRegs;
++  for (const InlineAsm::ConstraintInfo &CI : IA->ParseConstraints()) {
++    if (CI.Codes.size() != 1) {
++      contractError(F, "inline asm constraints must name one register each");
++      return nullptr;
++    }
++    const std::string &Code = CI.Codes[0];
++    if (CI.Type == InlineAsm::isInput) {
++      InputRegs.insert(Code);
++      continue;
++    }
++    RegNameSet Regs;
++    if (!parseRegList(Code, Regs, Err)) {
++      contractError(F, "inline asm constraint " + Twine(Code) + ": " + Err);
++      return nullptr;
++    }
++    for (const std::string &R : Regs) {
++      if (R == "memory" || Footprint.count(R))
++        continue;
++      contractError(F, "inline asm writes " + Twine(R) +
++                           ", which is not in " + ClobberAttr);
++      return nullptr;
++    }
++  }
++  if (InputRegs != ParamRegs) {
++    contractError(F, "inline asm inputs must be exactly the '" + Twine(RegAttr) +
++                         "' registers of the parameters");
++    return nullptr;
++  }
++  return Asm;
++}
++
++/// Replace \p CB by a copy of the contract body of \p F.
++void expandCall(CallBase &CB, Function &F, CallInst &Asm) {
++  std::string Site;
++  if (auto *Prev = dyn_cast_or_null<CallInst>(CB.getPrevNode())) {
++    if (auto *Marker = dyn_cast<InlineAsm>(Prev->getCalledOperand())) {
++      StringRef S = Marker->getAsmString();
++      if (S.consume_front(SiteMarker)) {
++        Site = S.trim().str();
++        Prev->eraseFromParent();
++      }
++    }
++  }
++  if (Site.empty())
++    if (const DebugLoc &DL = CB.getDebugLoc())
++      Site = (DL->getFilename() + ":" + Twine(DL.getLine())).str();
++
++  ValueToValueMapTy VMap;
++  for (Argument &A : F.args())
++    VMap[&A] = CB.getArgOperand(A.getArgNo());
++
++  Value *Ret = nullptr;
++  for (Instruction &I : F.getEntryBlock()) {
++    if (auto *RI = dyn_cast<ReturnInst>(&I)) {
++      if (Value *V = RI->getReturnValue()) {
++        Ret = VMap.lookup(V);
++        if (!Ret)
++          Ret = V;
++      }
++      break;
++    }
++    Instruction *New = I.clone();
++    New->insertBefore(CB.getIterator());
++    New->setDebugLoc(CB.getDebugLoc());
++    VMap[&I] = New;
++    RemapInstruction(New, VMap,
++                     RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
++    if (&I != &Asm)
++      continue;
++    auto *NewCall = cast<CallInst>(New);
++    const InlineAsm *IA = cast<InlineAsm>(NewCall->getCalledOperand());
++    std::string Header =
++        (Twine(AsmHeader) + F.getFnAttribute(ContractAttr).getValueAsString() +
++         " site=" + (Site.empty() ? StringRef("?") : StringRef(Site)) +
++         " clobber=" + F.getFnAttribute(ClobberAttr).getValueAsString() + "\n")
++            .str();
++    NewCall->setCalledOperand(InlineAsm::get(
++        IA->getFunctionType(), Header + IA->getAsmString().str(),
++        IA->getConstraintString(), IA->hasSideEffects(), IA->isAlignStack(),
++        IA->getDialect(), IA->canThrow()));
++    NewCall->addFnAttr(Attribute::Convergent);
++  }
++  if (!CB.getType()->isVoidTy())
++    CB.replaceAllUsesWith(Ret ? Ret : PoisonValue::get(CB.getType()));
++  CB.eraseFromParent();
++}
++
++bool AMDGPUExpandContractCalls::runOnModule(Module &M) {
++  bool Changed = false;
++  SmallVector<Function *, 4> Contracts;
++  for (Function &F : M)
++    if (F.hasFnAttribute(ContractAttr))
++      Contracts.push_back(&F);
++
++  for (Function *F : Contracts) {
++    if (F->use_empty())
++      continue;
++    CallInst *Asm = verifyContract(*F);
++    SmallVector<CallBase *, 8> Calls;
++    bool Valid = Asm != nullptr;
++    for (User *U : F->users()) {
++      auto *CB = dyn_cast<CallBase>(U);
++      if (!CB || CB->getCalledOperand() != F) {
++        if (Valid)
++          contractError(*F, "may only be called directly");
++        Valid = false;
++        continue;
++      }
++      if (CB->getFunction() == F) {
++        if (Valid)
++          contractError(*F, "may not call itself");
++        Valid = false;
++        continue;
++      }
++      Calls.push_back(CB);
++    }
++    if (Valid) {
++      for (CallBase *CB : Calls)
++        expandCall(*CB, *F, *Asm);
++    } else {
++      // Compilation has failed; drop the contract so that code generation
++      // does not compile it as an ordinary function and pile up follow-on
++      // diagnostics.
++      for (CallBase *CB : Calls) {
++        if (!CB->getType()->isVoidTy())
++          CB->replaceAllUsesWith(PoisonValue::get(CB->getType()));
++        CB->eraseFromParent();
++      }
++      F->replaceAllUsesWith(PoisonValue::get(F->getType()));
++    }
++    Changed = true;
++  }
++
++  for (Function *F : Contracts) {
++    if (F->use_empty()) {
++      F->eraseFromParent();
++      Changed = true;
++    }
++  }
++  return Changed;
++}
++
++//===----------------------------------------------------------------------===//
++// AMDGPUContractReport
++//===----------------------------------------------------------------------===//
++
++class AMDGPUContractReport : public MachineFunctionPass {
++public:
++  static char ID;
++  AMDGPUContractReport() : MachineFunctionPass(ID) {}
++  bool runOnMachineFunction(MachineFunction &MF) override;
++  StringRef getPassName() const override {
++    return "AMDGPU Register-Contract Report";
++  }
++  void getAnalysisUsage(AnalysisUsage &AU) const override {
++    AU.setPreservesAll();
++    MachineFunctionPass::getAnalysisUsage(AU);
++  }
++};
++
++struct CallSiteInfo {
++  std::string Contract, Site, Clobber;
++  SmallVector<unsigned, 16> LiveVGPRs, LiveSGPRs;
++  unsigned FreeVGPRs = 0, FreeSGPRs = 0;
++};
++
++struct SpillInfo {
++  std::string What;
++  std::string After; // closest contract call in the same block
++};
++
++bool AMDGPUContractReport::runOnMachineFunction(MachineFunction &MF) {
++  const Function &F = MF.getFunction();
++  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
++  const SIRegisterInfo &TRI = *ST.getRegisterInfo();
++  const MachineRegisterInfo &MRI = MF.getRegInfo();
++
++  StringRef Policy =
++      F.hasFnAttribute("amdgpu-spill-policy")
++          ? F.getFnAttribute("amdgpu-spill-policy").getValueAsString()
++          : StringRef(SpillPolicy);
++  const bool Strict = Policy == "error";
++  const unsigned LaneMax = F.getFnAttributeAsParsedInteger(
++      "amdgpu-sgpr-lane-spill-max", SGPRLaneSpillMax);
++  const bool WantReport = !ContractReportFile.empty();
++
++  const BitVector Reserved = TRI.getReservedRegs(MF);
++  const unsigned MaxVGPRs = ST.getMaxNumVGPRs(MF);
++
++  SmallVector<CallSiteInfo, 4> Sites;
++  SmallVector<SpillInfo, 4> VGPRSpills;
++  unsigned SGPRLaneSpills = 0;
++  std::string FirstLaneSpillAfter;
++
++  for (MachineBasicBlock &MBB : MF) {
++    // Contract calls in this block, in order, so a spill can name the
++    // closest preceding one.
++    std::string LastContract;
++    SmallVector<size_t, 4> PendingSpills;
++    auto Near = [&]() {
++      if (LastContract.empty())
++        return std::string();
++      return "after contract call " + LastContract;
++    };
++    for (MachineInstr &MI : MBB) {
++      if (MI.isInlineAsm()) {
++        StringRef S = MI.getOperand(InlineAsm::MIOp_AsmString).getSymbolName();
++        if (S.consume_front(AsmHeader)) {
++          StringRef Line = S.split('\n').first;
++          CallSiteInfo CS;
++          SmallVector<StringRef, 4> Fields;
++          Line.split(Fields, ' ', -1, false);
++          if (!Fields.empty())
++            CS.Contract = Fields[0].str();
++          for (StringRef Fld : drop_begin(Fields)) {
++            if (Fld.consume_front("site="))
++              CS.Site = Fld.str();
++            else if (Fld.consume_front("clobber="))
++              CS.Clobber = Fld.str();
++          }
++          LastContract = CS.Contract + "@" + CS.Site;
++          for (size_t I : PendingSpills)
++            VGPRSpills[I].After = "before contract call " + LastContract;
++          PendingSpills.clear();
++          Sites.push_back(std::move(CS));
++        }
++        continue;
++      }
++      if (SIInstrInfo::isSGPRSpill(MI)) {
++        if (MI.getOpcode() == AMDGPU::SI_SPILL_S32_TO_VGPR) {
++          if (!SGPRLaneSpills++)
++            FirstLaneSpillAfter = Near();
++        } else if (MI.mayStore()) {
++          if (LastContract.empty())
++            PendingSpills.push_back(VGPRSpills.size());
++          VGPRSpills.push_back(
++              {"SGPR spill to memory in bb." + std::to_string(MBB.getNumber()),
++               Near()});
++        }
++      } else if (SIInstrInfo::isVGPRSpill(MI) && MI.mayStore()) {
++        if (LastContract.empty())
++          PendingSpills.push_back(VGPRSpills.size());
++        VGPRSpills.push_back(
++            {"VGPR spill in bb." + std::to_string(MBB.getNumber()), Near()});
++      }
++    }
++  }
++
++  // Live-across registers of every contract call: live after the call and
++  // not written by it.
++  if (!Sites.empty() && MRI.tracksLiveness()) {
++    unsigned SiteIdx = 0;
++    SmallVector<std::pair<MachineInstr *, unsigned>, 4> SiteMIs;
++    for (MachineBasicBlock &MBB : MF)
++      for (MachineInstr &MI : MBB)
++        if (MI.isInlineAsm() &&
++            StringRef(MI.getOperand(InlineAsm::MIOp_AsmString).getSymbolName())
++                .starts_with(AsmHeader))
++          SiteMIs.push_back({&MI, SiteIdx++});
++
++    for (auto [SiteMI, Idx] : SiteMIs) {
++      SmallVector<std::string, 4> ReservedWrites;
++      for (const MachineOperand &MO : SiteMI->operands())
++        if (MO.isReg() && MO.isDef() && MO.getReg().isPhysical() &&
++            Reserved.test(MO.getReg()) &&
++            MO.getReg() != AMDGPU::SCC && MO.getReg() != AMDGPU::EXEC)
++          ReservedWrites.push_back(
++              AMDGPUInstPrinter::getRegisterName(MO.getReg()));
++      if (!ReservedWrites.empty())
++        F.getContext().diagnose(DiagnosticInfoGeneric(
++            "contract call " + Sites[Idx].Contract + "@" + Sites[Idx].Site +
++                " writes reserved register(s) " +
++                join(ReservedWrites, ", ") + " in function '" + F.getName() +
++                "'",
++            DS_Error));
++
++      MachineBasicBlock &MBB = *SiteMI->getParent();
++      LivePhysRegs Live(TRI);
++      Live.addLiveOuts(MBB);
++      for (MachineInstr &MI : reverse(MBB)) {
++        if (&MI == SiteMI)
++          break;
++        Live.stepBackward(MI);
++      }
++      CallSiteInfo &CS = Sites[Idx];
++      for (unsigned I = 0, E = AMDGPU::VGPR_32RegClass.getNumRegs(); I < E;
++           ++I) {
++        MCRegister R = AMDGPU::VGPR_32RegClass.getRegister(I);
++        bool Written = SiteMI->modifiesRegister(R, &TRI);
++        if (Live.contains(R) && !Written)
++          CS.LiveVGPRs.push_back(I);
++        if (I < MaxVGPRs && !Written && !Reserved.test(R))
++          ++CS.FreeVGPRs;
++      }
++      for (unsigned I = 0, E = AMDGPU::SGPR_32RegClass.getNumRegs(); I < E;
++           ++I) {
++        MCRegister R = AMDGPU::SGPR_32RegClass.getRegister(I);
++        bool Written = SiteMI->modifiesRegister(R, &TRI);
++        if (Live.contains(R) && !Written && !Reserved.test(R))
++          CS.LiveSGPRs.push_back(I);
++        if (!Written && !Reserved.test(R))
++          ++CS.FreeSGPRs;
++      }
++    }
++  }
++
++  const MachineFrameInfo &MFI = MF.getFrameInfo();
++  unsigned StackObjects = 0;
++  for (int FI = 0, E = MFI.getObjectIndexEnd(); FI < E; ++FI)
++    if (!MFI.isDeadObjectIndex(FI) && MFI.getObjectSize(FI) > 0 &&
++        !MFI.isSpillSlotObjectIndex(FI))
++      ++StackObjects;
++
++  std::string Status = "ok";
++  if (Strict) {
++    SmallString<256> Msg;
++    raw_svector_ostream OS(Msg);
++    for (const SpillInfo &S : VGPRSpills)
++      OS << "\n  " << S.What
++         << (S.After.empty() ? std::string() : " (" + S.After + ")");
++    if (SGPRLaneSpills > LaneMax)
++      OS << "\n  " << SGPRLaneSpills
++         << " SGPRs spilled to VGPR lanes, more than amdgpu-sgpr-lane-spill-max="
++         << LaneMax
++         << (FirstLaneSpillAfter.empty()
++                 ? std::string()
++                 : " (first one " + FirstLaneSpillAfter + ")");
++    if (StackObjects)
++      OS << "\n  " << StackObjects << " stack object(s) need scratch memory";
++    if (!Msg.empty()) {
++      Status = "error";
++      SmallString<512> Full;
++      raw_svector_ostream FOS(Full);
++      FOS << "function '" << F.getName()
++          << "' violates amdgpu-spill-policy=error:" << Msg;
++      for (const CallSiteInfo &CS : Sites)
++        FOS << "\n  contract call " << CS.Contract << "@" << CS.Site
++            << ": live across VGPR " << CS.LiveVGPRs.size() << " ["
++            << formatRegs('v', CS.LiveVGPRs) << "], SGPR "
++            << CS.LiveSGPRs.size() << ", free VGPR " << CS.FreeVGPRs
++            << ", free SGPR " << CS.FreeSGPRs;
++      if (WantReport)
++        FOS << "\n  see " << ContractReportFile;
++      F.getContext().diagnose(DiagnosticInfoGeneric(FOS.str(), DS_Error));
++    }
++  }
++
++  if (WantReport && (!Sites.empty() || Strict)) {
++    json::Array JSites;
++    for (const CallSiteInfo &CS : Sites)
++      JSites.push_back(json::Object{
++          {"contract", CS.Contract},
++          {"site", CS.Site},
++          {"clobber", CS.Clobber},
++          {"live_vgpr", (int64_t)CS.LiveVGPRs.size()},
++          {"live_sgpr", (int64_t)CS.LiveSGPRs.size()},
++          {"live_vgpr_regs", formatRegs('v', CS.LiveVGPRs)},
++          {"live_sgpr_regs", formatRegs('s', CS.LiveSGPRs)},
++          {"free_vgpr", (int64_t)CS.FreeVGPRs},
++          {"free_sgpr", (int64_t)CS.FreeSGPRs}});
++    json::Array JSpills;
++    for (const SpillInfo &S : VGPRSpills)
++      JSpills.push_back(json::Object{{"what", S.What}, {"near", S.After}});
++    json::Object Out{{"function", F.getName()},
++                     {"policy", Policy},
++                     {"max_vgpr", (int64_t)MaxVGPRs},
++                     {"callsites", std::move(JSites)},
++                     {"vgpr_spills", std::move(JSpills)},
++                     {"sgpr_lane_spills", (int64_t)SGPRLaneSpills},
++                     {"sgpr_lane_spill_max", (int64_t)LaneMax},
++                     {"stack_objects", (int64_t)StackObjects},
++                     {"status", Status}};
++    std::error_code EC;
++    raw_fd_ostream OS(ContractReportFile, EC, sys::fs::OF_Append);
++    if (EC)
++      F.getContext().diagnose(DiagnosticInfoGeneric(
++          "cannot write " + ContractReportFile + ": " + EC.message(),
++          DS_Warning));
++    else
++      OS << json::Value(std::move(Out)) << '\n';
++  }
++  return false;
++}
++
++} // end anonymous namespace
++
++char AMDGPUExpandContractCalls::ID = 0;
++char AMDGPUContractReport::ID = 0;
++char &llvm::AMDGPUContractReportID = AMDGPUContractReport::ID;
++
++INITIALIZE_PASS(AMDGPUExpandContractCalls, "amdgpu-expand-contract-calls",
++                "AMDGPU Expand Register-Contract Calls", false, false)
++INITIALIZE_PASS(AMDGPUContractReport, "amdgpu-contract-check",
++                "AMDGPU Register-Contract Report", false, true)
++
++ModulePass *llvm::createAMDGPUExpandContractCallsPass() {
++  return new AMDGPUExpandContractCalls();
++}
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPULowerVGPREncoding.cpp b/llvm/lib/Target/AMDGPU/AMDGPULowerVGPREncoding.cpp
+index 54fc33a4a..f865d6d9b 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPULowerVGPREncoding.cpp
++++ b/llvm/lib/Target/AMDGPU/AMDGPULowerVGPREncoding.cpp
+@@ -588,7 +588,15 @@ bool AMDGPULowerVGPREncoding::run(MachineFunction &MF) {
+ 
+       if (MI.isInlineAsm()) {
+         LLVM_DEBUG(dbgs() << "  inline asm: " << MI);
+-        if (TII->hasVGPRUses(MI))
++        // Inline asm is assembled with all MSBs zero. That includes asm that
++        // only writes VGPRs (outputs or clobbers), and register-contract code,
++        // which is pre-encoded for MSBs zero.
++        const MachineRegisterInfo &MRI = MF.getRegInfo();
++        if (StringRef(MI.getOperand(InlineAsm::MIOp_AsmString).getSymbolName())
++                .starts_with(";@amdgpu-contract ") ||
++            any_of(MI.operands(), [&](const MachineOperand &MO) {
++              return MO.isReg() && MO.getReg() && TRI->isVGPR(MRI, MO.getReg());
++            }))
+           resetMode(MI.getIterator());
+         continue;
+       }
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp b/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp
+index aa76b346d..c87c09baf 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp
++++ b/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp
+@@ -685,6 +685,8 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
+   initializeSILoadStoreOptimizerLegacyPass(*PR);
+   initializeAMDGPUCtorDtorLoweringLegacyPass(*PR);
+   initializeAMDGPUAlwaysInlinePass(*PR);
++  initializeAMDGPUExpandContractCallsPass(*PR);
++  initializeAMDGPUContractReportPass(*PR);
+   initializeAMDGPULowerExecSyncLegacyPass(*PR);
+   initializeAMDGPUSwLowerLDSLegacyPass(*PR);
+   initializeAMDGPUAnnotateUniformValuesLegacyPass(*PR);
+@@ -1499,6 +1501,10 @@ void AMDGPUPassConfig::addIRPasses() {
+   // with --expand-variadics-override=disable.
+   addPass(createExpandVariadicsPass(ExpandVariadicsMode::Lowering));
+ 
++  // Contract calls must be expanded before any inliner sees them.
++  if (TM.getTargetTriple().isAMDGCN())
++    addPass(createAMDGPUExpandContractCallsPass());
++
+   // Function calls are not supported, so make sure we inline everything.
+   addPass(createAMDGPUAlwaysInlinePass());
+   addPass(createAlwaysInlinerLegacyPass());
+@@ -1929,6 +1935,7 @@ bool GCNPassConfig::addRegAssignAndRewriteOptimized() {
+ }
+ 
+ void GCNPassConfig::addPostRegAlloc() {
++  addPass(&AMDGPUContractReportID);
+   addPass(&SIFixVGPRCopiesID);
+   if (getOptLevel() > CodeGenOptLevel::None)
+     addPass(&SIOptimizeExecMaskingLegacyID);
+diff --git a/llvm/lib/Target/AMDGPU/CMakeLists.txt b/llvm/lib/Target/AMDGPU/CMakeLists.txt
+index ae8f1c0fa..8a2eedd42 100644
+--- a/llvm/lib/Target/AMDGPU/CMakeLists.txt
++++ b/llvm/lib/Target/AMDGPU/CMakeLists.txt
+@@ -43,6 +43,7 @@ add_public_tablegen_target(AMDGPUCommonTableGen)
+ add_llvm_target(AMDGPUCodeGen
+   AMDGPUAliasAnalysis.cpp
+   AMDGPUAlwaysInlinePass.cpp
++  AMDGPUContract.cpp
+   AMDGPUAnnotateUniformValues.cpp
+   AMDGPUArgumentUsageInfo.cpp
+   AMDGPUAsanInstrumentation.cpp
+diff --git a/llvm/lib/Target/AMDGPU/SIISelLowering.cpp b/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
+index 8d96a0f06..806347813 100644
+--- a/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
++++ b/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
+@@ -19335,7 +19335,12 @@ SITargetLowering::getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI_,
+   auto [Kind, Idx, NumRegs] = AMDGPU::parseAsmConstraintPhysReg(Constraint);
+   if (Kind != '\0') {
+     if (Kind == 'v') {
+-      RC = &AMDGPU::VGPR_32_Lo256RegClass;
++      // An explicitly named VGPR above v255 is a fixed-register interface
++      // (e.g. for pre-encoded code); it can never be printed into asm text,
++      // which AMDGPUAsmPrinter::PrintAsmOperand diagnoses.
++      RC = Subtarget->has1024AddressableVGPRs()
++               ? &AMDGPU::VGPR_32RegClass
++               : &AMDGPU::VGPR_32_Lo256RegClass;
+     } else if (Kind == 's') {
+       RC = &AMDGPU::SGPR_32RegClass;
+     } else if (Kind == 'a') {
+@@ -19391,6 +19396,82 @@ SITargetLowering::getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI_,
+   return Ret;
+ }
+ 
++TargetLowering::AsmOperandInfoVector
++SITargetLowering::ParseConstraints(const DataLayout &DL,
++                                   const TargetRegisterInfo *TRI,
++                                   const CallBase &Call) const {
++  AsmOperandInfoVector Ops = TargetLowering::ParseConstraints(DL, TRI, Call);
++  const Function &F = *Call.getFunction();
++  // Constraints are parsed several times per call; report each call once.
++  const bool Diagnose = !AsmDiagCalls.contains(&Call);
++  auto Error = [&](const Twine &Msg) {
++    if (!Diagnose)
++      return;
++    F.getContext().diagnose(DiagnosticInfoInlineAsm(Call, Msg, DS_Error));
++    AsmDiagCalls.insert(&Call);
++  };
++  // Register-contract asm (see AMDGPUContract.cpp) must fit the budget
++  // exactly; other asm keeps the reserved-register warning for clobbers.
++  const auto *IA = dyn_cast<InlineAsm>(Call.getCalledOperand());
++  const bool IsContract =
++      IA && StringRef(IA->getAsmString()).starts_with(";@amdgpu-contract ");
++
++  const unsigned AddressableVGPRs =
++      Subtarget->has1024AddressableVGPRs() ? 1024 : 256;
++  const unsigned MaxVGPRs = Subtarget->getMaxNumVGPRs(F);
++  const unsigned AddressableSGPRs = AMDGPU::SGPR_32RegClass.getNumRegs();
++
++  // A register range clobber "~{v[a:b]}" names the set {va, ..., vb}, whether
++  // or not it happens to be a legal tuple. Expanded clobbers go to the end so
++  // that operand numbers used by matching constraints stay valid.
++  AsmOperandInfoVector Expanded;
++  for (AsmOperandInfo &Op : Ops) {
++    if (Op.Codes.size() != 1)
++      continue;
++    auto [Kind, Idx, NumRegs] = AMDGPU::parseAsmConstraintPhysReg(Op.Codes[0]);
++    if (Kind != 'v' && Kind != 's')
++      continue;
++    const unsigned Last = Idx + NumRegs - 1;
++    const std::string Name =
++        NumRegs == 1 ? (Twine(Kind) + Twine(Idx)).str()
++                     : (Twine(Kind) + "[" + Twine(Idx) + ":" + Twine(Last) + "]")
++                           .str();
++    const bool IsClobber = Op.Type == InlineAsm::isClobber;
++    // Nonexistent operand registers are diagnosed when they are allocated;
++    // nonexistent clobbers would otherwise be dropped silently.
++    if (Kind == 'v' && Last >= AddressableVGPRs) {
++      if (IsClobber)
++        Error("inline asm clobbers " + Name + ", but " + Subtarget->getCPU() +
++              " only has " + Twine(AddressableVGPRs) + " VGPRs");
++      continue;
++    }
++    if (Kind == 'v' && Last >= MaxVGPRs && (!IsClobber || IsContract) &&
++        AMDGPU::isEntryFunctionCC(F.getCallingConv())) {
++      Error("inline asm " + Twine(IsClobber ? "clobbers" : "uses") + " " +
++            Name + ", but function '" + F.getName() + "' may use at most " +
++            Twine(MaxVGPRs) +
++            " VGPRs (see amdgpu-flat-work-group-size / amdgpu-waves-per-eu)");
++      continue;
++    }
++    if (Kind == 's' && Last >= AddressableSGPRs) {
++      if (IsClobber)
++        Error("inline asm clobbers " + Name + ", but only s0-s" +
++              Twine(AddressableSGPRs - 1) + " exist");
++      continue;
++    }
++    if (!IsClobber || NumRegs == 1 ||
++        getRegForInlineAsmConstraint(TRI, Op.Codes[0], MVT::Other).first)
++      continue;
++    Op.Codes[0] = (Twine("{") + Twine(Kind) + Twine(Idx) + "}").str();
++    for (unsigned I = Idx + 1; I <= Last; ++I) {
++      Expanded.push_back(Op);
++      Expanded.back().Codes[0] = (Twine("{") + Twine(Kind) + Twine(I) + "}").str();
++    }
++  }
++  llvm::append_range(Ops, Expanded);
++  return Ops;
++}
++
+ static bool isImmConstraint(StringRef Constraint) {
+   if (Constraint.size() == 1) {
+     switch (Constraint[0]) {
+diff --git a/llvm/lib/Target/AMDGPU/SIISelLowering.h b/llvm/lib/Target/AMDGPU/SIISelLowering.h
+index 95ff5bba7..3a1bdf930 100644
+--- a/llvm/lib/Target/AMDGPU/SIISelLowering.h
++++ b/llvm/lib/Target/AMDGPU/SIISelLowering.h
+@@ -17,6 +17,7 @@
+ #include "AMDGPUArgumentUsageInfo.h"
+ #include "AMDGPUISelLowering.h"
+ #include "SIDefines.h"
++#include "llvm/ADT/SmallPtrSet.h"
+ #include "llvm/CodeGen/MachineFunction.h"
+ 
+ namespace llvm {
+@@ -33,6 +34,9 @@ class SITargetLowering final : public AMDGPUTargetLowering {
+ private:
+   const GCNSubtarget *Subtarget;
+ 
++  // Inline asm calls already diagnosed by ParseConstraints.
++  mutable SmallPtrSet<const CallBase *, 4> AsmDiagCalls;
++
+ public:
+   MVT getRegisterTypeForCallingConv(LLVMContext &Context,
+                                     CallingConv::ID CC,
+@@ -523,6 +527,9 @@ public:
+   std::pair<unsigned, const TargetRegisterClass *>
+   getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI,
+                                StringRef Constraint, MVT VT) const override;
++  AsmOperandInfoVector ParseConstraints(const DataLayout &DL,
++                                        const TargetRegisterInfo *TRI,
++                                        const CallBase &Call) const override;
+   ConstraintType getConstraintType(StringRef Constraint) const override;
+   void LowerAsmOperandForConstraint(SDValue Op, StringRef Constraint,
+                                     std::vector<SDValue> &Ops,
+diff --git a/llvm/test/CMakeLists.txt b/llvm/test/CMakeLists.txt
+index 201f0ee86..1ce8f671e 100644
+--- a/llvm/test/CMakeLists.txt
++++ b/llvm/test/CMakeLists.txt
+@@ -162,6 +162,10 @@ set(LLVM_TEST_DEPENDS
+   yaml2obj
+   )
+ 
++if("AMDGPU" IN_LIST LLVM_TARGETS_TO_BUILD)
++  list(APPEND LLVM_TEST_DEPENDS amdgpu-asm-footprint)
++endif()
++
+ if(TARGET llvm-lto)
+   set(LLVM_TEST_DEPENDS ${LLVM_TEST_DEPENDS} llvm-lto)
+ endif()
+diff --git a/llvm/test/CodeGen/AMDGPU/amdgpu-contract-call.ll b/llvm/test/CodeGen/AMDGPU/amdgpu-contract-call.ll
+new file mode 100644
+index 000000000..47c09a02e
+--- /dev/null
++++ b/llvm/test/CodeGen/AMDGPU/amdgpu-contract-call.ll
+@@ -0,0 +1,54 @@
++; RUN: rm -f %t.json
++; RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -amdgpu-spill-policy=error -amdgpu-contract-report=%t.json < %s | FileCheck %s
++; RUN: FileCheck --check-prefix=REPORT --input-file=%t.json %s
++
++; A register-contract function is expanded in place: no call, no stack, its
++; parameters arrive in the declared registers, and caller values live across
++; the call stay outside the declared footprint.
++
++; CHECK-LABEL: k:
++; CHECK-NOT: s_swap
++; CHECK: v_readfirstlane_b32 s24,
++; CHECK: v_add_nc_u64_e32 v[0:1],
++; CHECK: ;@amdgpu-contract frag site=test.py:42 clobber=s[2:23],s[25:29],v[6:511],scc
++; CHECK-NEXT: .long 0xbf800000
++; CHECK-NOT: s_swap
++; CHECK: s_endpgm
++; CHECK-NOT: {{^}}frag:
++; CHECK: .private_segment_fixed_size: 0
++; CHECK-NOT: {{^}}frag:
++
++; REPORT: "callsites":[{"clobber":"s[2:23],s[25:29],v[6:511],scc","contract":"frag",
++; REPORT-SAME: "live_vgpr":2,"live_vgpr_regs":"v2,v4","site":"test.py:42"}]
++; REPORT-SAME: "function":"k","max_vgpr":512,"policy":"error"
++; REPORT-SAME: "stack_objects":0,"status":"ok","vgpr_spills":[]
++
++target triple = "amdgcn-amd-amdhsa"
++declare i32 @llvm.amdgcn.workitem.id.x()
++declare i32 @llvm.amdgcn.workgroup.id.x()
++declare i64 @llvm.amdgcn.readfirstlane.i64(i64)
++declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
++
++define void @frag(i64 "amdgpu-reg"="s[0:1]" %wg, i64 "amdgpu-reg"="v[0:1]" %buf, i32 "amdgpu-reg"="s24" %wave) #1 {
++  %wgu = call i64 @llvm.amdgcn.readfirstlane.i64(i64 %wg)
++  %wu = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %wave)
++  call void asm sideeffect ".long 0xbf800000", "{s[0:1]},{v[0:1]},{s24},~{s[2:23]},~{s[25:29]},~{v[6:511]},~{scc},~{memory}"(i64 %wgu, i64 %buf, i32 %wu)
++  ret void
++}
++
++define amdgpu_kernel void @k(ptr addrspace(1) %p) #0 {
++  %t = call i32 @llvm.amdgcn.workitem.id.x()
++  %g = call i32 @llvm.amdgcn.workgroup.id.x()
++  %a = getelementptr i32, ptr addrspace(1) %p, i32 %t
++  %v = load i32, ptr addrspace(1) %a
++  %gi = zext i32 %g to i64
++  %pi = ptrtoint ptr addrspace(1) %a to i64
++  %w = lshr i32 %t, 5
++  call void asm sideeffect ";@amdgpu-contract-site test.py:42", ""()
++  call void @frag(i64 %gi, i64 %pi, i32 %w)
++  %r = add i32 %v, %g
++  store i32 %r, ptr addrspace(1) %a
++  ret void
++}
++attributes #0 = { "amdgpu-flat-work-group-size"="256,256" }
++attributes #1 = { noinline convergent "amdgpu-contract"="frag" "amdgpu-contract-clobber"="s[2:23],s[25:29],v[6:511],scc" }
+diff --git a/llvm/test/CodeGen/AMDGPU/amdgpu-contract-errors.ll b/llvm/test/CodeGen/AMDGPU/amdgpu-contract-errors.ll
+new file mode 100644
+index 000000000..531f4a5ca
+--- /dev/null
++++ b/llvm/test/CodeGen/AMDGPU/amdgpu-contract-errors.ll
+@@ -0,0 +1,290 @@
++; RUN: rm -rf %t && split-file %s %t
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -amdgpu-spill-policy=error -filetype=null %t/over-budget.ll 2>&1 | FileCheck %t/over-budget.ll
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -amdgpu-spill-policy=error -filetype=null %t/nonexistent-vgpr.ll 2>&1 | FileCheck %t/nonexistent-vgpr.ll
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -amdgpu-spill-policy=error -filetype=null %t/write-outside-footprint.ll 2>&1 | FileCheck %t/write-outside-footprint.ll
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -amdgpu-spill-policy=error -filetype=null %t/missing-reg-attr.ll 2>&1 | FileCheck %t/missing-reg-attr.ll
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -amdgpu-spill-policy=error -filetype=null %t/input-mismatch.ll 2>&1 | FileCheck %t/input-mismatch.ll
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -amdgpu-spill-policy=error -filetype=null %t/address-taken.ll 2>&1 | FileCheck %t/address-taken.ll
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -amdgpu-spill-policy=error -filetype=null %t/reserved-reg.ll 2>&1 | FileCheck %t/reserved-reg.ll
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -amdgpu-spill-policy=error -filetype=null %t/spill.ll 2>&1 | FileCheck %t/spill.ll
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -filetype=null %t/declaration.ll 2>&1 | FileCheck %t/declaration.ll
++
++; Invalid register-contract functions and calls (see AMDGPUContract.cpp).
++; Each error names the contract, and for calls the site marker.
++
++
++;--- over-budget.ll
++; CHECK: error: inline asm clobbers v[4:600], but function 'k' may use at most 512 VGPRs
++declare i32 @llvm.amdgcn.workitem.id.x()
++declare i32 @llvm.amdgcn.workgroup.id.x()
++declare i64 @llvm.amdgcn.readfirstlane.i64(i64)
++declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
++
++define void @frag(i64 "amdgpu-reg"="s[0:1]" %wg, i64 "amdgpu-reg"="v[0:1]" %buf, i32 "amdgpu-reg"="s24" %wave) #1 {
++  %wgu = call i64 @llvm.amdgcn.readfirstlane.i64(i64 %wg)
++  %wu = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %wave)
++  call void asm sideeffect ".long 0xbf800000", "{s[0:1]},{v[0:1]},{s24},~{s[2:23]},~{s[25:29]},~{v[4:600]},~{scc},~{memory}"(i64 %wgu, i64 %buf, i32 %wu)
++  ret void
++}
++
++define amdgpu_kernel void @k(ptr addrspace(1) %p) #0 {
++  %t = call i32 @llvm.amdgcn.workitem.id.x()
++  %g = call i32 @llvm.amdgcn.workgroup.id.x()
++  %a = getelementptr i32, ptr addrspace(1) %p, i32 %t
++  %v = load i32, ptr addrspace(1) %a
++  %gi = zext i32 %g to i64
++  %pi = ptrtoint ptr addrspace(1) %a to i64
++  %w = lshr i32 %t, 5
++  call void asm sideeffect ";@amdgpu-contract-site test.py:42", ""()
++  call void @frag(i64 %gi, i64 %pi, i32 %w)
++  %r = add i32 %v, %g
++  store i32 %r, ptr addrspace(1) %a
++  ret void
++}
++attributes #0 = { "amdgpu-flat-work-group-size"="256,256" }
++attributes #1 = { noinline convergent "amdgpu-contract"="frag" "amdgpu-contract-clobber"="s[2:23],s[25:29],v[4:600],scc" }
++
++;--- nonexistent-vgpr.ll
++; CHECK: error: inline asm clobbers v[4:1024], but gfx1250 only has 1024 VGPRs
++declare i32 @llvm.amdgcn.workitem.id.x()
++declare i32 @llvm.amdgcn.workgroup.id.x()
++declare i64 @llvm.amdgcn.readfirstlane.i64(i64)
++declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
++
++define void @frag(i64 "amdgpu-reg"="s[0:1]" %wg, i64 "amdgpu-reg"="v[0:1]" %buf, i32 "amdgpu-reg"="s24" %wave) #1 {
++  %wgu = call i64 @llvm.amdgcn.readfirstlane.i64(i64 %wg)
++  %wu = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %wave)
++  call void asm sideeffect ".long 0xbf800000", "{s[0:1]},{v[0:1]},{s24},~{s[2:23]},~{s[25:29]},~{v[4:1024]},~{scc},~{memory}"(i64 %wgu, i64 %buf, i32 %wu)
++  ret void
++}
++
++define amdgpu_kernel void @k(ptr addrspace(1) %p) #0 {
++  %t = call i32 @llvm.amdgcn.workitem.id.x()
++  %g = call i32 @llvm.amdgcn.workgroup.id.x()
++  %a = getelementptr i32, ptr addrspace(1) %p, i32 %t
++  %v = load i32, ptr addrspace(1) %a
++  %gi = zext i32 %g to i64
++  %pi = ptrtoint ptr addrspace(1) %a to i64
++  %w = lshr i32 %t, 5
++  call void asm sideeffect ";@amdgpu-contract-site test.py:42", ""()
++  call void @frag(i64 %gi, i64 %pi, i32 %w)
++  %r = add i32 %v, %g
++  store i32 %r, ptr addrspace(1) %a
++  ret void
++}
++attributes #0 = { "amdgpu-flat-work-group-size"="256,256" }
++attributes #1 = { noinline convergent "amdgpu-contract"="frag" "amdgpu-contract-clobber"="s[2:23],s[25:29],v[4:511],scc" }
++
++;--- write-outside-footprint.ll
++; CHECK: error: contract function 'frag': inline asm writes vcc, which is not in amdgpu-contract-clobber
++declare i32 @llvm.amdgcn.workitem.id.x()
++declare i32 @llvm.amdgcn.workgroup.id.x()
++declare i64 @llvm.amdgcn.readfirstlane.i64(i64)
++declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
++
++define void @frag(i64 "amdgpu-reg"="s[0:1]" %wg, i64 "amdgpu-reg"="v[0:1]" %buf, i32 "amdgpu-reg"="s24" %wave) #1 {
++  %wgu = call i64 @llvm.amdgcn.readfirstlane.i64(i64 %wg)
++  %wu = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %wave)
++  call void asm sideeffect ".long 0xbf800000", "{s[0:1]},{v[0:1]},{s24},~{s[2:23]},~{s[25:29]},~{v[6:511]},~{scc},~{vcc},~{memory}"(i64 %wgu, i64 %buf, i32 %wu)
++  ret void
++}
++
++define amdgpu_kernel void @k(ptr addrspace(1) %p) #0 {
++  %t = call i32 @llvm.amdgcn.workitem.id.x()
++  %g = call i32 @llvm.amdgcn.workgroup.id.x()
++  %a = getelementptr i32, ptr addrspace(1) %p, i32 %t
++  %v = load i32, ptr addrspace(1) %a
++  %gi = zext i32 %g to i64
++  %pi = ptrtoint ptr addrspace(1) %a to i64
++  %w = lshr i32 %t, 5
++  call void asm sideeffect ";@amdgpu-contract-site test.py:42", ""()
++  call void @frag(i64 %gi, i64 %pi, i32 %w)
++  %r = add i32 %v, %g
++  store i32 %r, ptr addrspace(1) %a
++  ret void
++}
++attributes #0 = { "amdgpu-flat-work-group-size"="256,256" }
++attributes #1 = { noinline convergent "amdgpu-contract"="frag" "amdgpu-contract-clobber"="s[2:23],s[25:29],v[6:511],scc" }
++
++;--- missing-reg-attr.ll
++; CHECK: error: contract function 'frag': parameter 2 has no 'amdgpu-reg' attribute
++declare i32 @llvm.amdgcn.workitem.id.x()
++declare i32 @llvm.amdgcn.workgroup.id.x()
++declare i64 @llvm.amdgcn.readfirstlane.i64(i64)
++declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
++
++define void @frag(i64 "amdgpu-reg"="s[0:1]" %wg, i64 "amdgpu-reg"="v[0:1]" %buf, i32 %wave) #1 {
++  %wgu = call i64 @llvm.amdgcn.readfirstlane.i64(i64 %wg)
++  %wu = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %wave)
++  call void asm sideeffect ".long 0xbf800000", "{s[0:1]},{v[0:1]},{s24},~{s[2:23]},~{s[25:29]},~{v[6:511]},~{scc},~{memory}"(i64 %wgu, i64 %buf, i32 %wu)
++  ret void
++}
++
++define amdgpu_kernel void @k(ptr addrspace(1) %p) #0 {
++  %t = call i32 @llvm.amdgcn.workitem.id.x()
++  %g = call i32 @llvm.amdgcn.workgroup.id.x()
++  %a = getelementptr i32, ptr addrspace(1) %p, i32 %t
++  %v = load i32, ptr addrspace(1) %a
++  %gi = zext i32 %g to i64
++  %pi = ptrtoint ptr addrspace(1) %a to i64
++  %w = lshr i32 %t, 5
++  call void asm sideeffect ";@amdgpu-contract-site test.py:42", ""()
++  call void @frag(i64 %gi, i64 %pi, i32 %w)
++  %r = add i32 %v, %g
++  store i32 %r, ptr addrspace(1) %a
++  ret void
++}
++attributes #0 = { "amdgpu-flat-work-group-size"="256,256" }
++attributes #1 = { noinline convergent "amdgpu-contract"="frag" "amdgpu-contract-clobber"="s[2:23],s[25:29],v[6:511],scc" }
++
++;--- input-mismatch.ll
++; CHECK: error: contract function 'frag': inline asm inputs must be exactly the 'amdgpu-reg' registers of the parameters
++declare i32 @llvm.amdgcn.workitem.id.x()
++declare i32 @llvm.amdgcn.workgroup.id.x()
++declare i64 @llvm.amdgcn.readfirstlane.i64(i64)
++declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
++
++define void @frag(i64 "amdgpu-reg"="s[0:1]" %wg, i64 "amdgpu-reg"="v[0:1]" %buf, i32 "amdgpu-reg"="s23" %wave) #1 {
++  %wgu = call i64 @llvm.amdgcn.readfirstlane.i64(i64 %wg)
++  %wu = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %wave)
++  call void asm sideeffect ".long 0xbf800000", "{s[0:1]},{v[0:1]},{s24},~{s[2:23]},~{s[25:29]},~{v[6:511]},~{scc},~{memory}"(i64 %wgu, i64 %buf, i32 %wu)
++  ret void
++}
++
++define amdgpu_kernel void @k(ptr addrspace(1) %p) #0 {
++  %t = call i32 @llvm.amdgcn.workitem.id.x()
++  %g = call i32 @llvm.amdgcn.workgroup.id.x()
++  %a = getelementptr i32, ptr addrspace(1) %p, i32 %t
++  %v = load i32, ptr addrspace(1) %a
++  %gi = zext i32 %g to i64
++  %pi = ptrtoint ptr addrspace(1) %a to i64
++  %w = lshr i32 %t, 5
++  call void asm sideeffect ";@amdgpu-contract-site test.py:42", ""()
++  call void @frag(i64 %gi, i64 %pi, i32 %w)
++  %r = add i32 %v, %g
++  store i32 %r, ptr addrspace(1) %a
++  ret void
++}
++attributes #0 = { "amdgpu-flat-work-group-size"="256,256" }
++attributes #1 = { noinline convergent "amdgpu-contract"="frag" "amdgpu-contract-clobber"="s[2:23],s[25:29],v[6:511],scc" }
++
++;--- address-taken.ll
++; CHECK: error: contract function 'frag': may only be called directly
++declare i32 @llvm.amdgcn.workitem.id.x()
++declare i32 @llvm.amdgcn.workgroup.id.x()
++declare i64 @llvm.amdgcn.readfirstlane.i64(i64)
++declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
++
++define void @frag(i64 "amdgpu-reg"="s[0:1]" %wg, i64 "amdgpu-reg"="v[0:1]" %buf, i32 "amdgpu-reg"="s24" %wave) #1 {
++  %wgu = call i64 @llvm.amdgcn.readfirstlane.i64(i64 %wg)
++  %wu = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %wave)
++  call void asm sideeffect ".long 0xbf800000", "{s[0:1]},{v[0:1]},{s24},~{s[2:23]},~{s[25:29]},~{v[6:511]},~{scc},~{memory}"(i64 %wgu, i64 %buf, i32 %wu)
++  ret void
++}
++
++define amdgpu_kernel void @k(ptr addrspace(1) %p) #0 {
++  %t = call i32 @llvm.amdgcn.workitem.id.x()
++  %g = call i32 @llvm.amdgcn.workgroup.id.x()
++  %a = getelementptr i32, ptr addrspace(1) %p, i32 %t
++  %v = load i32, ptr addrspace(1) %a
++  %gi = zext i32 %g to i64
++  %pi = ptrtoint ptr addrspace(1) %a to i64
++  %w = lshr i32 %t, 5
++  call void asm sideeffect ";@amdgpu-contract-site test.py:42", ""()
++  call void @frag(i64 %gi, i64 %pi, i32 %w)
++  store ptr @frag, ptr addrspace(1) %p
++  %r = add i32 %v, %g
++  store i32 %r, ptr addrspace(1) %a
++  ret void
++}
++attributes #0 = { "amdgpu-flat-work-group-size"="256,256" }
++attributes #1 = { noinline convergent "amdgpu-contract"="frag" "amdgpu-contract-clobber"="s[2:23],s[25:29],v[6:511],scc" }
++
++;--- reserved-reg.ll
++; CHECK: error: contract call frag@test.py:42 writes reserved register(s) s32 in function 'k'
++declare i32 @llvm.amdgcn.workitem.id.x()
++declare i32 @llvm.amdgcn.workgroup.id.x()
++declare i64 @llvm.amdgcn.readfirstlane.i64(i64)
++declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
++
++define void @frag(i64 "amdgpu-reg"="s[0:1]" %wg, i64 "amdgpu-reg"="v[0:1]" %buf, i32 "amdgpu-reg"="s24" %wave) #1 {
++  %wgu = call i64 @llvm.amdgcn.readfirstlane.i64(i64 %wg)
++  %wu = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %wave)
++  call void asm sideeffect ".long 0xbf800000", "{s[0:1]},{v[0:1]},{s24},~{s[2:23]},~{s[25:33]},~{v[6:511]},~{scc},~{memory}"(i64 %wgu, i64 %buf, i32 %wu)
++  ret void
++}
++
++define amdgpu_kernel void @k(ptr addrspace(1) %p) #0 {
++  %t = call i32 @llvm.amdgcn.workitem.id.x()
++  %g = call i32 @llvm.amdgcn.workgroup.id.x()
++  %a = getelementptr i32, ptr addrspace(1) %p, i32 %t
++  %v = load i32, ptr addrspace(1) %a
++  %gi = zext i32 %g to i64
++  %pi = ptrtoint ptr addrspace(1) %a to i64
++  %w = lshr i32 %t, 5
++  call void asm sideeffect ";@amdgpu-contract-site test.py:42", ""()
++  call void @frag(i64 %gi, i64 %pi, i32 %w)
++  %r = add i32 %v, %g
++  store i32 %r, ptr addrspace(1) %a
++  ret void
++}
++attributes #0 = { "amdgpu-flat-work-group-size"="256,256" }
++attributes #1 = { noinline convergent "amdgpu-contract"="frag" "amdgpu-contract-clobber"="s[2:23],s[25:33],v[6:511],scc" }
++
++;--- spill.ll
++; CHECK: error: function 'k' violates amdgpu-spill-policy=error:
++; CHECK-NEXT: VGPR spill in bb.0 (before contract call frag@test.py:42)
++; CHECK-NEXT: contract call frag@test.py:42: live across VGPR 1 [v2]
++declare i32 @llvm.amdgcn.workitem.id.x()
++declare i32 @llvm.amdgcn.workgroup.id.x()
++declare i64 @llvm.amdgcn.readfirstlane.i64(i64)
++declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
++
++define void @frag(i64 "amdgpu-reg"="s[0:1]" %wg, i64 "amdgpu-reg"="v[0:1]" %buf, i32 "amdgpu-reg"="s24" %wave) #1 {
++  %wgu = call i64 @llvm.amdgcn.readfirstlane.i64(i64 %wg)
++  %wu = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %wave)
++  call void asm sideeffect ".long 0xbf800000", "{s[0:1]},{v[0:1]},{s24},~{s[2:23]},~{s[25:29]},~{v[4:511]},~{scc},~{memory}"(i64 %wgu, i64 %buf, i32 %wu)
++  ret void
++}
++
++define amdgpu_kernel void @k(ptr addrspace(1) %p) #0 {
++  %t = call i32 @llvm.amdgcn.workitem.id.x()
++  %g = call i32 @llvm.amdgcn.workgroup.id.x()
++  %a = getelementptr i32, ptr addrspace(1) %p, i32 %t
++  %v = load i32, ptr addrspace(1) %a
++  %gi = zext i32 %g to i64
++  %pi = ptrtoint ptr addrspace(1) %a to i64
++  %w = lshr i32 %t, 5
++  call void asm sideeffect ";@amdgpu-contract-site test.py:42", ""()
++  call void @frag(i64 %gi, i64 %pi, i32 %w)
++  %r = add i32 %v, %g
++  store i32 %r, ptr addrspace(1) %a
++  ret void
++}
++attributes #0 = { "amdgpu-flat-work-group-size"="256,256" }
++attributes #1 = { noinline convergent "amdgpu-contract"="frag" "amdgpu-contract-clobber"="s[2:23],s[25:29],v[4:511],scc" }
++
++;--- declaration.ll
++; CHECK: error: contract function 'frag': has no body; link the bitcode that defines it
++declare i32 @llvm.amdgcn.workitem.id.x()
++declare i32 @llvm.amdgcn.workgroup.id.x()
++declare i64 @llvm.amdgcn.readfirstlane.i64(i64)
++declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
++
++declare void @frag(i64 "amdgpu-reg"="s[0:1]", i64 "amdgpu-reg"="v[0:1]", i32 "amdgpu-reg"="s24") #1
++define amdgpu_kernel void @k(ptr addrspace(1) %p) #0 {
++  %t = call i32 @llvm.amdgcn.workitem.id.x()
++  %g = call i32 @llvm.amdgcn.workgroup.id.x()
++  %a = getelementptr i32, ptr addrspace(1) %p, i32 %t
++  %v = load i32, ptr addrspace(1) %a
++  %gi = zext i32 %g to i64
++  %pi = ptrtoint ptr addrspace(1) %a to i64
++  %w = lshr i32 %t, 5
++  call void asm sideeffect ";@amdgpu-contract-site test.py:42", ""()
++  call void @frag(i64 %gi, i64 %pi, i32 %w)
++  %r = add i32 %v, %g
++  store i32 %r, ptr addrspace(1) %a
++  ret void
++}
++attributes #0 = { "amdgpu-flat-work-group-size"="256,256" }
++attributes #1 = { noinline convergent "amdgpu-contract"="frag" "amdgpu-contract-clobber"="s[2:23],s[25:29],v[6:511],scc" }
+diff --git a/llvm/test/CodeGen/AMDGPU/inline-asm-out-of-bounds-register.ll b/llvm/test/CodeGen/AMDGPU/inline-asm-out-of-bounds-register.ll
+index d5bf18264..8e9fa6554 100644
+--- a/llvm/test/CodeGen/AMDGPU/inline-asm-out-of-bounds-register.ll
++++ b/llvm/test/CodeGen/AMDGPU/inline-asm-out-of-bounds-register.ll
+@@ -1,7 +1,11 @@
+-; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=bonaire -filetype=null %s 2>&1 | FileCheck -implicit-check-not=error %s
+-; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -filetype=null %s 2>&1 | FileCheck -implicit-check-not=error %s
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=bonaire -filetype=null %s 2>&1 | FileCheck -check-prefixes=CHECK,LO256 -implicit-check-not=error %s
++; RUN: not llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -filetype=null %s 2>&1 | FileCheck -check-prefixes=CHECK,GFX1250 -implicit-check-not=error %s
+ 
+-; CHECK: error: could not allocate output register for constraint '{v256}'
++; gfx1250 has 1024 VGPRs: v256 and above are valid fixed-register operands,
++; but cannot be printed into assembly text.
++
++; LO256: error: could not allocate output register for constraint '{v256}'
++; GFX1250: error: inline asm operand is assigned to v256, which cannot be written in assembly text
+ define void @out_of_bounds_vgpr32_def() {
+   %v = tail call i32 asm sideeffect "v_mov_b32 $0, -1", "={v256}"()
+   ret void
+@@ -19,7 +23,7 @@ define void @out_of_bounds_vgpr64_def_low_tuple() {
+   ret void
+ }
+ 
+-; CHECK: error: could not allocate input reg for constraint '{v256}'
++; LO256: error: could not allocate input reg for constraint '{v256}'
+ define void @out_of_bounds_vgpr32_use() {
+   %v = tail call i32 asm sideeffect "v_mov_b32 %0, %1", "=v,{v256}"(i32 123)
+   ret void
+@@ -31,7 +35,7 @@ define void @out_of_bounds_vgpr64_high_tuple() {
+   ret void
+ }
+ 
+-; CHECK: error: could not allocate input reg for constraint '{v[256:257]}'
++; LO256: error: could not allocate input reg for constraint '{v[256:257]}'
+ define void @out_of_bounds_vgpr64_low_tuple() {
+   tail call void asm sideeffect "; use %0", "{v[256:257]}"(i64 123)
+   ret void
+diff --git a/llvm/test/CodeGen/AMDGPU/llc-pipeline.ll b/llvm/test/CodeGen/AMDGPU/llc-pipeline.ll
+index 070c87379..c089ff59e 100644
+--- a/llvm/test/CodeGen/AMDGPU/llc-pipeline.ll
++++ b/llvm/test/CodeGen/AMDGPU/llc-pipeline.ll
+@@ -37,6 +37,7 @@
+ ; GCN-O0-NEXT:      Uniformity Analysis
+ ; GCN-O0-NEXT:      AMDGPU Uniform Intrinsic Combine
+ ; GCN-O0-NEXT:    Expand variadic functions
++; GCN-O0-NEXT:    AMDGPU Expand Register-Contract Calls
+ ; GCN-O0-NEXT:    AMDGPU Inline All Functions
+ ; GCN-O0-NEXT:    Inliner for always_inline functions
+ ; GCN-O0-NEXT:      FunctionPass Manager
+@@ -129,6 +130,7 @@
+ ; GCN-O0-NEXT:        SI Lower WWM Copies
+ ; GCN-O0-NEXT:        AMDGPU Reserve WWM Registers
+ ; GCN-O0-NEXT:        Fast Register Allocator
++; GCN-O0-NEXT:        AMDGPU Register-Contract Report
+ ; GCN-O0-NEXT:        SI Fix VGPR copies
+ ; GCN-O0-NEXT:        Remove Redundant DEBUG_VALUE analysis
+ ; GCN-O0-NEXT:        Fixup Statepoint Caller Saved
+@@ -197,6 +199,7 @@
+ ; GCN-O1-NEXT:      Uniformity Analysis
+ ; GCN-O1-NEXT:      AMDGPU Uniform Intrinsic Combine
+ ; GCN-O1-NEXT:    Expand variadic functions
++; GCN-O1-NEXT:    AMDGPU Expand Register-Contract Calls
+ ; GCN-O1-NEXT:    AMDGPU Inline All Functions
+ ; GCN-O1-NEXT:    Inliner for always_inline functions
+ ; GCN-O1-NEXT:      FunctionPass Manager
+@@ -398,6 +401,7 @@
+ ; GCN-O1-NEXT:        Stack Slot Coloring
+ ; GCN-O1-NEXT:        Machine Copy Propagation Pass
+ ; GCN-O1-NEXT:        Machine Loop Invariant Code Motion
++; GCN-O1-NEXT:        AMDGPU Register-Contract Report
+ ; GCN-O1-NEXT:        SI Fix VGPR copies
+ ; GCN-O1-NEXT:        SI optimize exec mask operations
+ ; GCN-O1-NEXT:        Remove Redundant DEBUG_VALUE analysis
+@@ -488,6 +492,7 @@
+ ; GCN-O1-OPTS-NEXT:      Uniformity Analysis
+ ; GCN-O1-OPTS-NEXT:      AMDGPU Uniform Intrinsic Combine
+ ; GCN-O1-OPTS-NEXT:    Expand variadic functions
++; GCN-O1-OPTS-NEXT:    AMDGPU Expand Register-Contract Calls
+ ; GCN-O1-OPTS-NEXT:    AMDGPU Inline All Functions
+ ; GCN-O1-OPTS-NEXT:    Inliner for always_inline functions
+ ; GCN-O1-OPTS-NEXT:      FunctionPass Manager
+@@ -716,6 +721,7 @@
+ ; GCN-O1-OPTS-NEXT:        Stack Slot Coloring
+ ; GCN-O1-OPTS-NEXT:        Machine Copy Propagation Pass
+ ; GCN-O1-OPTS-NEXT:        Machine Loop Invariant Code Motion
++; GCN-O1-OPTS-NEXT:        AMDGPU Register-Contract Report
+ ; GCN-O1-OPTS-NEXT:        SI Fix VGPR copies
+ ; GCN-O1-OPTS-NEXT:        SI optimize exec mask operations
+ ; GCN-O1-OPTS-NEXT:        Remove Redundant DEBUG_VALUE analysis
+@@ -807,6 +813,7 @@
+ ; GCN-O2-NEXT:      Uniformity Analysis
+ ; GCN-O2-NEXT:      AMDGPU Uniform Intrinsic Combine
+ ; GCN-O2-NEXT:    Expand variadic functions
++; GCN-O2-NEXT:    AMDGPU Expand Register-Contract Calls
+ ; GCN-O2-NEXT:    AMDGPU Inline All Functions
+ ; GCN-O2-NEXT:    Inliner for always_inline functions
+ ; GCN-O2-NEXT:      FunctionPass Manager
+@@ -1039,6 +1046,7 @@
+ ; GCN-O2-NEXT:        Stack Slot Coloring
+ ; GCN-O2-NEXT:        Machine Copy Propagation Pass
+ ; GCN-O2-NEXT:        Machine Loop Invariant Code Motion
++; GCN-O2-NEXT:        AMDGPU Register-Contract Report
+ ; GCN-O2-NEXT:        SI Fix VGPR copies
+ ; GCN-O2-NEXT:        SI optimize exec mask operations
+ ; GCN-O2-NEXT:        Remove Redundant DEBUG_VALUE analysis
+@@ -1130,6 +1138,7 @@
+ ; GCN-O3-NEXT:      Uniformity Analysis
+ ; GCN-O3-NEXT:      AMDGPU Uniform Intrinsic Combine
+ ; GCN-O3-NEXT:    Expand variadic functions
++; GCN-O3-NEXT:    AMDGPU Expand Register-Contract Calls
+ ; GCN-O3-NEXT:    AMDGPU Inline All Functions
+ ; GCN-O3-NEXT:    Inliner for always_inline functions
+ ; GCN-O3-NEXT:      FunctionPass Manager
+@@ -1375,6 +1384,7 @@
+ ; GCN-O3-NEXT:        Stack Slot Coloring
+ ; GCN-O3-NEXT:        Machine Copy Propagation Pass
+ ; GCN-O3-NEXT:        Machine Loop Invariant Code Motion
++; GCN-O3-NEXT:        AMDGPU Register-Contract Report
+ ; GCN-O3-NEXT:        SI Fix VGPR copies
+ ; GCN-O3-NEXT:        SI optimize exec mask operations
+ ; GCN-O3-NEXT:        Remove Redundant DEBUG_VALUE analysis
+diff --git a/llvm/test/CodeGen/AMDGPU/sgpr-regalloc-flags.ll b/llvm/test/CodeGen/AMDGPU/sgpr-regalloc-flags.ll
+index fc5dabc58..3c7e8ad13 100644
+--- a/llvm/test/CodeGen/AMDGPU/sgpr-regalloc-flags.ll
++++ b/llvm/test/CodeGen/AMDGPU/sgpr-regalloc-flags.ll
+@@ -49,6 +49,7 @@
+ ; O0-NEXT: SI Lower WWM Copies
+ ; O0-NEXT: AMDGPU Reserve WWM Registers
+ ; O0-NEXT: Fast Register Allocator
++; O0-NEXT: AMDGPU Register-Contract Report
+ ; O0-NEXT: SI Fix VGPR copies
+ 
+ 
+diff --git a/llvm/test/tools/amdgpu-asm-footprint/basic.s b/llvm/test/tools/amdgpu-asm-footprint/basic.s
+new file mode 100644
+index 000000000..7cd7cbdc9
+--- /dev/null
++++ b/llvm/test/tools/amdgpu-asm-footprint/basic.s
+@@ -0,0 +1,45 @@
++# RUN: llvm-mc -triple=amdgcn-amd-amdhsa -mcpu=gfx1250 -filetype=obj %s -o %t.o
++# RUN: amdgpu-asm-footprint %t.o -mcpu=gfx1250 --symbol=frag | FileCheck --check-prefix=FRAG %s
++# RUN: amdgpu-asm-footprint %t.o -mcpu=gfx1250 --symbol=leaks_msb | FileCheck --check-prefix=LEAK %s
++
++# Writes come from the instruction descriptions; v256 and up are found by
++# following s_set_vgpr_msb.
++
++  .text
++  .globl frag
++  .type frag,@function
++frag:
++  s_mov_b32 s5, 1
++  s_cmp_eq_u32 s0, 0
++  v_mov_b32 v3, v1
++  s_set_vgpr_msb 0x40
++  v_mov_b32 v0, v1
++  s_set_vgpr_msb 0
++  s_endpgm
++  .size frag, .-frag
++
++  .globl leaks_msb
++  .type leaks_msb,@function
++leaks_msb:
++  s_set_vgpr_msb 0x40
++  v_mov_b32 v7, v1
++  .size leaks_msb, .-leaks_msb
++
++# FRAG: "forbidden": [
++# FRAG-NEXT: {
++# FRAG-NEXT: "offset": 24,
++# FRAG-NEXT: "opcode": "S_ENDPGM{{.*}}"
++# FRAG: "reads": {
++# FRAG: "sgpr": "s0",
++# FRAG: "vgpr": "v1"
++# FRAG: "vgpr_msb_exit": 0,
++# FRAG: "writes": {
++# FRAG: "sgpr": "s5",
++# FRAG-NEXT: "special": [
++# FRAG-NEXT: "scc"
++# FRAG-NEXT: ],
++# FRAG-NEXT: "vgpr": "v3,v256"
++
++# LEAK: "forbidden": [],
++# LEAK: "vgpr_msb_exit": 64,
++# LEAK: "vgpr": "v263"
+diff --git a/llvm/test/tools/amdgpu-asm-footprint/lit.local.cfg b/llvm/test/tools/amdgpu-asm-footprint/lit.local.cfg
+new file mode 100644
+index 000000000..8807a0edb
+--- /dev/null
++++ b/llvm/test/tools/amdgpu-asm-footprint/lit.local.cfg
+@@ -0,0 +1,2 @@
++if "AMDGPU" not in config.root.targets:
++    config.unsupported = True
+diff --git a/llvm/tools/amdgpu-asm-footprint/CMakeLists.txt b/llvm/tools/amdgpu-asm-footprint/CMakeLists.txt
+new file mode 100644
+index 000000000..6442548ab
+--- /dev/null
++++ b/llvm/tools/amdgpu-asm-footprint/CMakeLists.txt
+@@ -0,0 +1,27 @@
++if(NOT "AMDGPU" IN_LIST LLVM_TARGETS_TO_BUILD)
++  return()
++endif()
++
++set(LLVM_LINK_COMPONENTS
++  AMDGPUDesc
++  AMDGPUDisassembler
++  AMDGPUInfo
++  AMDGPUUtils
++  MC
++  MCDisassembler
++  Object
++  Support
++  TargetParser
++  )
++
++include_directories(
++  ${LLVM_MAIN_SRC_DIR}/lib/Target/AMDGPU
++  ${LLVM_BINARY_DIR}/lib/Target/AMDGPU
++  )
++
++add_llvm_tool(amdgpu-asm-footprint
++  amdgpu-asm-footprint.cpp
++
++  DEPENDS
++  AMDGPUCommonTableGen
++  )
+diff --git a/llvm/tools/amdgpu-asm-footprint/amdgpu-asm-footprint.cpp b/llvm/tools/amdgpu-asm-footprint/amdgpu-asm-footprint.cpp
+new file mode 100644
+index 000000000..089ae7cc8
+--- /dev/null
++++ b/llvm/tools/amdgpu-asm-footprint/amdgpu-asm-footprint.cpp
+@@ -0,0 +1,337 @@
++//===- amdgpu-asm-footprint.cpp - Registers written by AMDGPU code --------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Decodes the code of an AMDGPU object file (or one symbol in it) and prints,
++// as JSON, every register the code writes and reads, the VGPR MSB state at the
++// end, and instructions that must not appear in a register-contract function.
++//
++// Writes are taken from the instruction descriptions (explicit and implicit
++// defs), and VGPRs above v255 are resolved by following s_set_vgpr_msb in
++// program order.
++//
++//===----------------------------------------------------------------------===//
++
++#include "MCTargetDesc/AMDGPUInstPrinter.h"
++#include "MCTargetDesc/AMDGPUMCTargetDesc.h"
++#include "SIDefines.h"
++#include "Utils/AMDGPUBaseInfo.h"
++#include "llvm/MC/MCAsmInfo.h"
++#include "llvm/MC/MCContext.h"
++#include "llvm/MC/MCDisassembler/MCDisassembler.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCInstrAnalysis.h"
++#include "llvm/MC/MCInstrInfo.h"
++#include "llvm/MC/MCRegisterInfo.h"
++#include "llvm/MC/MCSubtargetInfo.h"
++#include "llvm/MC/MCTargetOptions.h"
++#include "llvm/MC/TargetRegistry.h"
++#include "llvm/Object/ELFObjectFile.h"
++#include "llvm/Object/ObjectFile.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/InitLLVM.h"
++#include "llvm/Support/JSON.h"
++#include "llvm/Support/TargetSelect.h"
++#include "llvm/Support/WithColor.h"
++#include "llvm/Support/raw_ostream.h"
++#include <set>
++
++using namespace llvm;
++using namespace llvm::object;
++
++static cl::opt<std::string> InputFile(cl::Positional, cl::desc("<object>"),
++                                      cl::Required);
++static cl::opt<std::string> MCPU("mcpu", cl::desc("Target CPU"),
++                                 cl::init("gfx1250"));
++static cl::opt<std::string> Symbol("symbol",
++                                   cl::desc("Only analyze this symbol "
++                                            "(default: the whole .text)"),
++                                   cl::init(""));
++static cl::opt<std::string>
++    BytesOut("bytes-out", cl::desc("Write the analyzed code bytes to this file"),
++             cl::init(""));
++static cl::opt<unsigned> InitialMSBs(
++    "initial-vgpr-msb",
++    cl::desc("VGPR MSB state (s_set_vgpr_msb encoding) at the first "
++             "instruction"),
++    cl::init(0));
++
++namespace {
++
++[[noreturn]] void fail(const Twine &Msg) {
++  WithColor::error(errs(), "amdgpu-asm-footprint") << Msg << '\n';
++  exit(1);
++}
++
++/// Same mapping the instruction printer uses to show "v0 /*v256*/".
++MCRegister applyMSBs(MCRegister Reg, unsigned OpNo, const MCInstrDesc &Desc,
++                     const MCRegisterInfo &MRI, unsigned MSBs) {
++  if (!MSBs)
++    return Reg;
++  if (!(MRI.getEncodingValue(Reg) & AMDGPU::HWEncoding::IS_VGPR))
++    return Reg;
++  auto Ops = AMDGPU::getVGPRLoweringOperandTables(Desc);
++  if (!Ops.first)
++    return Reg;
++  unsigned Opc = Desc.getOpcode();
++  unsigned I;
++  for (I = 0; I < 4; ++I) {
++    if (Ops.first[I] != AMDGPU::OpName::NUM_OPERAND_NAMES &&
++        (unsigned)AMDGPU::getNamedOperandIdx(Opc, Ops.first[I]) == OpNo)
++      break;
++    if (Ops.second && Ops.second[I] != AMDGPU::OpName::NUM_OPERAND_NAMES &&
++        (unsigned)AMDGPU::getNamedOperandIdx(Opc, Ops.second[I]) == OpNo)
++      break;
++  }
++  if (I == 4)
++    return Reg;
++  unsigned OpMSBs = (MSBs >> (I * 2)) & 3;
++  if (!OpMSBs)
++    return Reg;
++  if (MCRegister New = AMDGPU::getVGPRWithMSBs(Reg, OpMSBs, MRI))
++    return New;
++  return Reg;
++}
++
++struct RegSets {
++  std::set<unsigned> VGPR, SGPR;
++  std::set<std::string> Special;
++};
++
++class Analyzer {
++  const MCRegisterInfo &MRI;
++  const MCRegisterClass &VGPR32, &SGPR32;
++
++public:
++  explicit Analyzer(const MCRegisterInfo &MRI)
++      : MRI(MRI), VGPR32(MRI.getRegClass(AMDGPU::VGPR_32RegClassID)),
++        SGPR32(MRI.getRegClass(AMDGPU::SGPR_32RegClassID)) {}
++
++  void add(MCRegister Reg, RegSets &S) const {
++    bool Any = false;
++    for (MCRegister Sub : MRI.subregs_inclusive(Reg)) {
++      if (VGPR32.contains(Sub)) {
++        S.VGPR.insert(MRI.getEncodingValue(Sub) &
++                      AMDGPU::HWEncoding::REG_IDX_MASK);
++        Any = true;
++      } else if (SGPR32.contains(Sub)) {
++        S.SGPR.insert(MRI.getEncodingValue(Sub) &
++                      AMDGPU::HWEncoding::REG_IDX_MASK);
++        Any = true;
++      }
++    }
++    if (Any)
++      return;
++    switch (Reg.id()) {
++    case AMDGPU::VCC:
++    case AMDGPU::VCC_LO:
++    case AMDGPU::VCC_HI:
++      S.Special.insert("vcc");
++      return;
++    case AMDGPU::EXEC:
++    case AMDGPU::EXEC_LO:
++    case AMDGPU::EXEC_HI:
++      S.Special.insert("exec");
++      return;
++    case AMDGPU::SCC:
++      S.Special.insert("scc");
++      return;
++    case AMDGPU::M0:
++      S.Special.insert("m0");
++      return;
++    case AMDGPU::MODE:
++      S.Special.insert("mode");
++      return;
++    default:
++      S.Special.insert(StringRef(AMDGPUInstPrinter::getRegisterName(Reg)).lower());
++    }
++  }
++};
++
++std::string formatRange(char Kind, const std::set<unsigned> &Idx) {
++  std::string S;
++  raw_string_ostream OS(S);
++  for (auto I = Idx.begin(); I != Idx.end();) {
++    unsigned First = *I, Last = *I;
++    for (++I; I != Idx.end() && *I == Last + 1; ++I)
++      Last = *I;
++    if (!S.empty())
++      OS << ',';
++    if (First == Last)
++      OS << Kind << First;
++    else
++      OS << Kind << '[' << First << ':' << Last << ']';
++  }
++  return S;
++}
++
++json::Object toJSON(const RegSets &S) {
++  json::Array Special;
++  for (const std::string &N : S.Special)
++    Special.push_back(N);
++  return json::Object{{"vgpr", formatRange('v', S.VGPR)},
++                      {"sgpr", formatRange('s', S.SGPR)},
++                      {"special", std::move(Special)},
++                      {"num_vgpr", (int64_t)S.VGPR.size()},
++                      {"num_sgpr", (int64_t)S.SGPR.size()}};
++}
++
++} // namespace
++
++int main(int argc, char **argv) {
++  InitLLVM X(argc, argv);
++  LLVMInitializeAMDGPUTargetInfo();
++  LLVMInitializeAMDGPUTargetMC();
++  LLVMInitializeAMDGPUDisassembler();
++  cl::ParseCommandLineOptions(argc, argv,
++                              "registers written by AMDGPU machine code\n");
++
++  Expected<OwningBinary<ObjectFile>> ObjOrErr =
++      ObjectFile::createObjectFile(InputFile);
++  if (!ObjOrErr)
++    fail(toString(ObjOrErr.takeError()));
++  ObjectFile &Obj = *ObjOrErr->getBinary();
++
++  Triple TT("amdgcn-amd-amdhsa");
++  std::string Err;
++  const Target *T = TargetRegistry::lookupTarget(TT, Err);
++  if (!T)
++    fail(Err);
++  std::unique_ptr<MCRegisterInfo> MRI(T->createMCRegInfo(TT));
++  MCTargetOptions MCOpts;
++  std::unique_ptr<MCAsmInfo> MAI(T->createMCAsmInfo(*MRI, TT, MCOpts));
++  std::unique_ptr<MCSubtargetInfo> STI(
++      T->createMCSubtargetInfo(TT, MCPU, ""));
++  std::unique_ptr<MCInstrInfo> MII(T->createMCInstrInfo());
++  if (!MRI || !MAI || !STI || !MII)
++    fail("cannot create the AMDGPU MC layer for " + MCPU);
++  MCContext Ctx(TT, *MAI, *MRI, *STI);
++  std::unique_ptr<MCDisassembler> DisAsm(T->createMCDisassembler(*STI, Ctx));
++  if (!DisAsm)
++    fail("no disassembler");
++
++  // Locate the bytes to analyze.
++  ArrayRef<uint8_t> Bytes;
++  uint64_t Base = 0;
++  bool HasRelocs = false;
++  for (const SectionRef &Sec : Obj.sections()) {
++    Expected<StringRef> Name = Sec.getName();
++    if (!Name || *Name != ".text")
++      continue;
++    Expected<StringRef> Contents = Sec.getContents();
++    if (!Contents)
++      fail(toString(Contents.takeError()));
++    Bytes = arrayRefFromStringRef(*Contents);
++    Base = Sec.getAddress();
++    HasRelocs = !Sec.relocations().empty();
++    if (!Symbol.empty()) {
++      bool Found = false;
++      for (const SymbolRef &Sym : Obj.symbols()) {
++        Expected<StringRef> SName = Sym.getName();
++        if (!SName || *SName != Symbol)
++          continue;
++        uint64_t Addr = cantFail(Sym.getAddress());
++        uint64_t Size = ELFSymbolRef(Sym).getSize();
++        if (!Size || Addr < Base || Addr + Size > Base + Bytes.size())
++          fail("symbol '" + Symbol + "' has no size or is outside .text");
++        Bytes = Bytes.slice(Addr - Base, Size);
++        Base = Addr;
++        Found = true;
++        break;
++      }
++      if (!Found)
++        fail("symbol '" + Symbol + "' not found");
++    }
++    break;
++  }
++  if (Bytes.empty())
++    fail("no .text code in " + InputFile);
++  if (!BytesOut.empty()) {
++    std::error_code EC;
++    raw_fd_ostream OS(BytesOut, EC);
++    if (EC)
++      fail("cannot write " + BytesOut + ": " + EC.message());
++    OS.write(reinterpret_cast<const char *>(Bytes.data()), Bytes.size());
++  }
++
++  Analyzer A(*MRI);
++  RegSets Writes, Reads;
++  json::Array Forbidden;
++  unsigned MSBs = InitialMSBs;
++  unsigned NumInsts = 0, Branches = 0;
++  bool UsesHighVGPRs = InitialMSBs != 0;
++
++  for (uint64_t Off = 0; Off < Bytes.size();) {
++    MCInst Inst;
++    uint64_t Size = 0;
++    if (DisAsm->getInstruction(Inst, Size, Bytes.slice(Off), Base + Off,
++                               nulls()) != MCDisassembler::Success ||
++        !Size)
++      fail("cannot decode instruction at offset " + Twine(Off));
++    ++NumInsts;
++    const MCInstrDesc &Desc = MII->get(Inst.getOpcode());
++    StringRef OpName = MII->getName(Inst.getOpcode());
++
++    for (unsigned I = 0, E = Inst.getNumOperands(); I < E; ++I) {
++      const MCOperand &Op = Inst.getOperand(I);
++      if (!Op.isReg() || !Op.getReg())
++        continue;
++      MCRegister R = applyMSBs(Op.getReg(), I, Desc, *MRI, MSBs);
++      A.add(R, I < Desc.getNumDefs() ? Writes : Reads);
++    }
++    // The VGPR MSBs live in MODE but are checked through vgpr_msb_exit.
++    const bool IsSetMSB = Inst.getOpcode() == AMDGPU::S_SET_VGPR_MSB_gfx12;
++    for (MCPhysReg R : Desc.implicit_defs())
++      if (!(IsSetMSB && R == AMDGPU::MODE))
++        A.add(R, Writes);
++    for (MCPhysReg R : Desc.implicit_uses())
++      A.add(R, Reads);
++
++    if (OpName.starts_with("S_SETREG") || OpName.starts_with("S_ROUND_MODE") ||
++        OpName.starts_with("S_DENORM_MODE"))
++      Writes.Special.insert("mode");
++    if (Desc.isBranch())
++      ++Branches;
++    for (StringRef Bad : {"S_ENDPGM", "S_SETPC", "S_SWAPPC", "S_SET_PC",
++                          "S_SWAP_PC", "S_CALL", "S_RFE"})
++      if (OpName.starts_with(Bad))
++        Forbidden.push_back(json::Object{{"offset", (int64_t)Off},
++                                         {"opcode", OpName}});
++
++    if (Inst.getOpcode() == AMDGPU::S_SET_VGPR_MSB_gfx12) {
++      MSBs = Inst.getOperand(0).getImm() & 0xff;
++    } else if (Inst.getOpcode() == AMDGPU::S_SETREG_IMM32_B32_gfx12 &&
++               STI->hasFeature(AMDGPU::Feature1024AddressableVGPRs)) {
++      if (auto M = AMDGPU::convertSetRegImmToVgprMSBs(
++              Inst, STI->hasFeature(AMDGPU::FeatureSetregVGPRMSBFixup)))
++        MSBs = *M;
++    }
++    if (MSBs)
++      UsesHighVGPRs = true;
++    Off += Size;
++  }
++
++  json::Array Warnings;
++  if (UsesHighVGPRs && Branches)
++    Warnings.push_back("VGPR MSBs are tracked in program order; check that "
++                       "every branch target is reached with the same MSBs");
++  if (HasRelocs)
++    Warnings.push_back(".text has relocations; the code is not "
++                       "position-independent as encoded");
++
++  json::Object Out{{"cpu", MCPU},
++                   {"bytes", (int64_t)Bytes.size()},
++                   {"instructions", (int64_t)NumInsts},
++                   {"writes", toJSON(Writes)},
++                   {"reads", toJSON(Reads)},
++                   {"vgpr_msb_exit", (int64_t)MSBs},
++                   {"has_relocations", HasRelocs},
++                   {"forbidden", std::move(Forbidden)},
++                   {"warnings", std::move(Warnings)}};
++  outs() << formatv("{0:2}", json::Value(std::move(Out))) << '\n';
++  return 0;
++}

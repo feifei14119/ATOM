@@ -1,0 +1,1093 @@
+diff --git a/python/flydsl/compiler/asm_contract.py b/python/flydsl/compiler/asm_contract.py
+new file mode 100644
+index 00000000..46a7ade0
+--- /dev/null
++++ b/python/flydsl/compiler/asm_contract.py
+@@ -0,0 +1,517 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 FlyDSL Project Contributors
++
++"""Register-contract ASM functions.
++
++A register-contract function wraps a hand-written AMDGPU assembly fragment as
++an LLVM function whose parameters live in fixed registers and whose register
++footprint is declared up front.  The AMDGPU backend (``amdgpu-contract``
++attributes) expands each call in place: there is no call ABI, no stack and no
++register save/restore.  Live caller values are kept out of the footprint by the
++register allocator, and the backend reports (or rejects) any spill around the
++call.
++
++Offline, :func:`pack` turns ``fragment.s`` plus a manifest into
++``<name>.contract.bc`` and a ``<name>.contract.json`` sidecar::
++
++    name: dq_convert
++    source: dq_convert.inline.s
++    symbol: mono_dq_convert_inline_fragment
++    target: gfx1250
++    align: 64                       # optional: keep the fragment 64B aligned
++    params:
++      - {name: args, reg: "s[0:1]", type: uint64}   # SGPR params must be uniform
++      - {name: lane, reg: v0,       type: uint32}
++      - {name: wave, reg: s24,      type: uint32}
++    clobbers: [ "s[2:23]", "s[25:29]", "s[40:48]", "v[4:45]", scc ]   # optional
++    preserves: [exec, mode]         # written, but restored by the fragment
++    memory: true                    # the fragment reads/writes memory
++
++In a kernel, :func:`ffi_contract` loads the sidecar and emits the call::
++
++    dq = ffi_contract("build/dq_convert.contract.json")
++    dq(args=addr, lane=tid & 31, wave=tid >> 5)
++
++Final code generation must use an LLVM with the contract passes, selected with
++``FLYDSL_COMPILE_LLVM_DIR``.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import inspect
++import json
++import os
++import re
++import subprocess
++import sys
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Sequence
++
++SIDECAR_VERSION = 1
++SITE_MARKER = ";@amdgpu-contract-site"
++FORBIDDEN_SPECIAL_WRITES = ("exec", "mode", "m0", "vcc")
++
++_INT_TYPES = {"int32": "i32", "uint32": "i32", "int64": "i64", "uint64": "i64"}
++
++
++class ContractError(RuntimeError):
++    """Raised when a fragment does not satisfy its register contract."""
++
++
++# --------------------------------------------------------------------------- #
++# Register sets
++# --------------------------------------------------------------------------- #
++
++_REG_RE = re.compile(r"^([sv])(?:(\d+)|\[(\d+):(\d+)\])$")
++
++
++def parse_regs(items) -> set:
++    """Parse ``["s[2:23]", "v4", "scc"]`` (or a comma string) into a set.
++
++    GPRs become ``("s", 5)`` / ``("v", 4)`` tuples, others stay names.
++    """
++    if isinstance(items, str):
++        items = [p for p in items.split(",")]
++    out = set()
++    for raw in items:
++        item = str(raw).strip().lower()
++        if not item:
++            continue
++        m = _REG_RE.match(item)
++        if not m:
++            out.add(item)
++            continue
++        kind = m.group(1)
++        lo = int(m.group(2) if m.group(2) is not None else m.group(3))
++        hi = int(m.group(2) if m.group(2) is not None else m.group(4))
++        if hi < lo:
++            raise ContractError(f"bad register range {raw!r}")
++        out.update((kind, i) for i in range(lo, hi + 1))
++    return out
++
++
++def format_regs(regs: set) -> str:
++    parts = []
++    for kind in ("s", "v"):
++        idx = sorted(i for k, i in (r for r in regs if isinstance(r, tuple)) if k == kind)
++        i = 0
++        while i < len(idx):
++            j = i
++            while j + 1 < len(idx) and idx[j + 1] == idx[j] + 1:
++                j += 1
++            parts.append(f"{kind}{idx[i]}" if i == j else f"{kind}[{idx[i]}:{idx[j]}]")
++            i = j + 1
++    parts.extend(sorted(r for r in regs if isinstance(r, str)))
++    return ",".join(parts)
++
++
++def _single_reg_count(reg: str) -> tuple:
++    regs = parse_regs([reg])
++    kinds = {r[0] for r in regs if isinstance(r, tuple)}
++    if len(kinds) != 1 or len(regs) not in (1, 2):
++        raise ContractError(f"parameter register {reg!r} must be one or two SGPRs or VGPRs")
++    idx = sorted(r[1] for r in regs)
++    if idx[-1] - idx[0] + 1 != len(idx):
++        raise ContractError(f"parameter register {reg!r} is not contiguous")
++    if len(idx) == 2 and kinds == {"s"} and idx[0] % 2:
++        raise ContractError(f"64-bit SGPR parameter {reg!r} must start at an even SGPR")
++    return kinds.pop(), len(idx)
++
++
++# --------------------------------------------------------------------------- #
++# Manifest
++# --------------------------------------------------------------------------- #
++
++
++@dataclass
++class Param:
++    name: str
++    reg: str
++    type: str
++
++    @property
++    def kind(self) -> str:
++        return _single_reg_count(self.reg)[0]
++
++    @property
++    def llvm_type(self) -> str:
++        return _INT_TYPES[self.type]
++
++
++@dataclass
++class Manifest:
++    name: str
++    source: Path
++    target: str = "gfx1250"
++    symbol: Optional[str] = None
++    align: int = 0
++    params: List[Param] = field(default_factory=list)
++    clobbers: Optional[List[str]] = None
++    preserves: List[str] = field(default_factory=list)
++    memory: bool = True
++
++    @classmethod
++    def load(cls, path) -> "Manifest":
++        path = Path(path)
++        text = path.read_text(encoding="utf-8")
++        if path.suffix in (".yaml", ".yml"):
++            import yaml
++
++            data = yaml.safe_load(text)
++        else:
++            data = json.loads(text)
++        return cls.from_dict(data, base=path.parent)
++
++    @classmethod
++    def from_dict(cls, data: Dict[str, Any], base: Path = Path(".")) -> "Manifest":
++        known = {"name", "source", "target", "symbol", "align", "params", "clobbers", "preserves", "memory"}
++        unknown = set(data) - known
++        if unknown:
++            raise ContractError(f"unknown manifest keys: {sorted(unknown)}")
++        name = str(data["name"])
++        if not re.match(r"^[A-Za-z_][A-Za-z0-9_.]*$", name):
++            raise ContractError(f"contract name {name!r} is not a valid symbol")
++        params = []
++        for p in data.get("params", []):
++            ptype = str(p.get("type", "uint32"))
++            if ptype not in _INT_TYPES:
++                raise ContractError(f"param {p.get('name')!r}: type must be one of {sorted(_INT_TYPES)}")
++            param = Param(str(p["name"]), str(p["reg"]).lower().replace(" ", ""), ptype)
++            kind, count = _single_reg_count(param.reg)
++            if count * 32 != int(param.llvm_type[1:]):
++                raise ContractError(f"param {param.name!r}: {param.type} does not fit {param.reg}")
++            params.append(param)
++        names = [p.name for p in params]
++        if len(set(names)) != len(names):
++            raise ContractError("duplicate parameter names")
++        source = Path(data["source"])
++        if not source.is_absolute():
++            source = (base / source).resolve()
++        clobbers = data.get("clobbers")
++        if isinstance(clobbers, str):
++            clobbers = [c for c in clobbers.split(",")]
++        align = int(data.get("align", 0) or 0)
++        if align and align & (align - 1):
++            raise ContractError("align must be a power of two")
++        return cls(
++            name=name,
++            source=source,
++            target=str(data.get("target", "gfx1250")),
++            symbol=data.get("symbol"),
++            align=align,
++            params=params,
++            clobbers=clobbers,
++            preserves=[str(p).lower() for p in data.get("preserves", [])],
++            memory=bool(data.get("memory", True)),
++        )
++
++
++# --------------------------------------------------------------------------- #
++# Packing
++# --------------------------------------------------------------------------- #
++
++
++def _llvm_bin(llvm_dir: Optional[str]) -> Path:
++    raw = llvm_dir or os.environ.get("FLYDSL_COMPILE_LLVM_DIR", "")
++    if not raw:
++        raise ContractError("pass --llvm-dir or set FLYDSL_COMPILE_LLVM_DIR to an LLVM with the contract passes")
++    prefix = Path(raw).expanduser().resolve()
++    return prefix / "bin"
++
++
++def _run(cmd: Sequence[str]) -> str:
++    proc = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
++    if proc.returncode:
++        raise ContractError(f"command failed: {' '.join(map(str, cmd))}\n{proc.stderr}")
++    return proc.stdout
++
++
++def _sha256(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++
++
++def _escape_ll(s: str) -> str:
++    out = []
++    for ch in s:
++        if ch == '"' or ch == "\\" or not (" " <= ch <= "~"):
++            out.append(f"\\{ord(ch):02X}")
++        else:
++            out.append(ch)
++    return "".join(out)
++
++
++def _generate_ll(m: Manifest, words: List[int], clobber: str) -> str:
++    asm_lines = []
++    if m.align:
++        # Keep the fragment's alignment; a numeric label is safe to repeat.
++        asm_lines += ["s_branch 1f", f".p2align {m.align.bit_length() - 1}", "1:"]
++    asm_lines += [f".long 0x{w:08x}" for w in words]
++    asm = "\n".join(asm_lines) + "\n"
++
++    constraints = [f"{{{p.reg}}}" for p in m.params]
++    constraints += [f"~{{{c}}}" for c in clobber.split(",") if c]
++    if m.memory:
++        constraints.append("~{memory}")
++
++    args = ", ".join(f'{p.llvm_type} "amdgpu-reg"="{p.reg}" %{p.name}' for p in m.params)
++    body = []
++    operands = []
++    for p in m.params:
++        if p.kind == "s":
++            # The value must be wave-uniform; this makes it legal in an SGPR.
++            body.append(
++                f"  %{p.name}.u = call {p.llvm_type} @llvm.amdgcn.readfirstlane.{p.llvm_type}({p.llvm_type} %{p.name})"
++            )
++            operands.append(f"{p.llvm_type} %{p.name}.u")
++        else:
++            operands.append(f"{p.llvm_type} %{p.name}")
++
++    decls = sorted(
++        {
++            f"declare {p.llvm_type} @llvm.amdgcn.readfirstlane.{p.llvm_type}({p.llvm_type})"
++            for p in m.params
++            if p.kind == "s"
++        }
++    )
++    lines = [
++        f"; Generated by flydsl.compiler.asm_contract from {m.source.name}. Do not edit.",
++        'target triple = "amdgcn-amd-amdhsa"',
++        "",
++        f"define void @{m.name}({args}) #0 {{",
++        *body,
++        f'  call void asm sideeffect "{_escape_ll(asm)}", "{",".join(constraints)}"({", ".join(operands)})',
++        "  ret void",
++        "}",
++        "",
++        *decls,
++        "",
++        f'attributes #0 = {{ noinline convergent nounwind "amdgpu-contract"="{m.name}" '
++        f'"amdgpu-contract-clobber"="{clobber}" "target-cpu"="{m.target}" }}',
++        "",
++    ]
++    return "\n".join(lines)
++
++
++def check_footprint(m: Manifest, fp: Dict[str, Any]) -> tuple:
++    """Check a footprint against the manifest. Returns (clobber, warnings)."""
++    errors, warnings = [], list(fp.get("warnings", []))
++    writes_gpr = parse_regs(fp["writes"]["sgpr"]) | parse_regs(fp["writes"]["vgpr"])
++    writes_special = set(fp["writes"]["special"])
++    preserves = set(m.preserves)
++
++    if fp["forbidden"]:
++        ops = ", ".join(f"{f['opcode']}@{f['offset']}" for f in fp["forbidden"])
++        errors.append(f"forbidden control flow in fragment: {ops}")
++    if fp["has_relocations"]:
++        errors.append("fragment has relocations; it must be position independent")
++    if fp["vgpr_msb_exit"] != 0:
++        errors.append(f"fragment ends with VGPR MSBs 0x{fp['vgpr_msb_exit']:x}; restore s_set_vgpr_msb 0")
++
++    inputs = set()
++    for p in m.params:
++        inputs |= parse_regs([p.reg])
++    written_inputs = inputs & writes_gpr
++    if written_inputs:
++        errors.append(f"fragment writes input register(s) {format_regs(written_inputs)}")
++
++    special_clobber = writes_special - preserves
++    if m.clobbers is None:
++        declared = writes_gpr | special_clobber
++    else:
++        declared = parse_regs(m.clobbers)
++        missing = (writes_gpr | special_clobber) - declared
++        if missing:
++            errors.append(f"fragment writes {format_regs(missing)}, which is not in clobbers")
++        unused = {r for r in declared - writes_gpr - writes_special if r != "memory"}
++        if unused:
++            warnings.append(f"clobbers {format_regs(unused)} are declared but never written")
++        if declared & inputs:
++            errors.append(f"clobbers overlap the inputs: {format_regs(declared & inputs)}")
++    declared.discard("memory")
++    bad_special = {r for r in declared if isinstance(r, str)} & set(FORBIDDEN_SPECIAL_WRITES) - {"vcc"}
++    if bad_special:
++        errors.append(
++            f"fragment changes {', '.join(sorted(bad_special))}; restore it inside the fragment "
++            "and list it under 'preserves'"
++        )
++    if errors:
++        raise ContractError(f"contract {m.name!r}:\n  " + "\n  ".join(errors))
++    return format_regs(declared), warnings
++
++
++def pack(manifest, out_dir, *, llvm_dir: Optional[str] = None) -> Dict[str, Any]:
++    """Assemble, audit and package a fragment. Returns the sidecar dict."""
++    m = manifest if isinstance(manifest, Manifest) else Manifest.load(manifest)
++    out_dir = Path(out_dir)
++    out_dir.mkdir(parents=True, exist_ok=True)
++    bin_dir = _llvm_bin(llvm_dir)
++
++    src = m.source.read_bytes()
++    obj = out_dir / f"{m.name}.fragment.o"
++    _run([bin_dir / "llvm-mc", "-triple=amdgcn-amd-amdhsa", f"-mcpu={m.target}", "-filetype=obj", m.source, "-o", obj])
++    code_path = out_dir / f"{m.name}.fragment.bin"
++    fp_cmd = [bin_dir / "amdgpu-asm-footprint", obj, f"-mcpu={m.target}", f"--bytes-out={code_path}"]
++    if m.symbol:
++        fp_cmd.append(f"--symbol={m.symbol}")
++    fp = json.loads(_run(fp_cmd))
++    clobber, warnings = check_footprint(m, fp)
++
++    code = code_path.read_bytes()
++    if len(code) % 4:
++        raise ContractError("fragment size is not a multiple of 4 bytes")
++    words = [int.from_bytes(code[i : i + 4], "little") for i in range(0, len(code), 4)]
++
++    ll_path = out_dir / f"{m.name}.contract.ll"
++    bc_path = out_dir / f"{m.name}.contract.bc"
++    ll_path.write_text(_generate_ll(m, words, clobber), encoding="utf-8")
++    _run([bin_dir / "llvm-as", ll_path, "-o", bc_path])
++
++    sidecar = {
++        "version": SIDECAR_VERSION,
++        "name": m.name,
++        "symbol": m.name,
++        "target": m.target,
++        "bitcode": bc_path.name,
++        "params": [{"name": p.name, "reg": p.reg, "type": p.type} for p in m.params],
++        "clobber": clobber,
++        "preserves": m.preserves,
++        "memory": m.memory,
++        "source": str(m.source),
++        "source_sha256": _sha256(src),
++        "fragment_bytes": len(code),
++        "fragment_sha256": _sha256(code),
++        "footprint": {"writes": fp["writes"], "reads": fp["reads"], "instructions": fp["instructions"]},
++        "warnings": warnings,
++    }
++    (out_dir / f"{m.name}.contract.json").write_text(json.dumps(sidecar, indent=2) + "\n", encoding="utf-8")
++    return sidecar
++
++
++# --------------------------------------------------------------------------- #
++# Kernel-side call
++# --------------------------------------------------------------------------- #
++
++
++def _user_site(depth: int = 3) -> str:
++    """``file:line`` of the innermost user frames, innermost first."""
++    from ..expr.meta import _is_framework_file
++
++    sites = []
++    frame = inspect.currentframe()
++    try:
++        while frame is not None and len(sites) < depth:
++            if not _is_framework_file(frame.f_code.co_filename):
++                sites.append(f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}")
++            frame = frame.f_back
++    finally:
++        del frame
++    # The site goes into asm text and a JSON report; keep it to one token.
++    return "<".join(sites) or "unknown"
++
++
++class ContractFunction:
++    """Kernel-side callable for a packed register-contract function."""
++
++    def __init__(self, sidecar_path):
++        from ..expr.extern import ExternFunction
++
++        self.sidecar_path = Path(sidecar_path).resolve()
++        data = json.loads(self.sidecar_path.read_text(encoding="utf-8"))
++        if data.get("version") != SIDECAR_VERSION:
++            raise ContractError(f"{self.sidecar_path}: unsupported sidecar version {data.get('version')}")
++        self.info = data
++        self.name = data["name"]
++        self.params = data["params"]
++        self.bitcode_path = str(self.sidecar_path.parent / data["bitcode"])
++        self._extern = ExternFunction(data["symbol"], [p["type"] for p in self.params], "void", convergent=True)
++
++    @property
++    def clobber(self) -> str:
++        return self.info["clobber"]
++
++    def __call__(self, *args, **kwargs):
++        from .._mlir.dialects import llvm
++        from .extern_link import _register_link_metadata
++
++        names = [p["name"] for p in self.params]
++        if len(args) > len(names):
++            raise TypeError(f"{self.name}() takes {len(names)} argument(s), got {len(args)}")
++        values = dict(zip(names, args))
++        for k, v in kwargs.items():
++            if k not in names:
++                raise TypeError(f"{self.name}() got an unexpected argument {k!r}; parameters: {names}")
++            if k in values:
++                raise TypeError(f"{self.name}() got multiple values for {k!r}")
++            values[k] = v
++        missing = [n for n in names if n not in values]
++        if missing:
++            raise TypeError(f"{self.name}() missing argument(s): {missing}")
++
++        _register_link_metadata(self.bitcode_path, None)
++        # Must immediately precede the call; the backend consumes it.
++        llvm.inline_asm(
++            None,
++            [],
++            f"{SITE_MARKER} {_user_site()}",
++            "",
++            has_side_effects=True,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++        )
++        return self._extern(*[values[n] for n in names])
++
++    def __repr__(self) -> str:
++        regs = ", ".join(f"{p['name']}@{p['reg']}" for p in self.params)
++        return f"ffi_contract({self.name}: {regs}; clobber={self.clobber})"
++
++
++def ffi_contract(sidecar_path) -> ContractFunction:
++    """Load ``<name>.contract.json`` written by :func:`pack`."""
++    return ContractFunction(sidecar_path)
++
++
++def spill_hints(policy: str = "error", *, sgpr_lane_spill_max: int = 0, report: Optional[str] = None) -> dict:
++    """LLVM options for the contract checks, for ``compile_hints['llvm_options']``."""
++    if policy not in ("allow", "error"):
++        raise ValueError("policy must be 'allow' or 'error'")
++    opts = {"amdgpu-spill-policy": policy, "amdgpu-sgpr-lane-spill-max": int(sgpr_lane_spill_max)}
++    if report:
++        opts["amdgpu-contract-report"] = str(report)
++    return opts
++
++
++# --------------------------------------------------------------------------- #
++# CLI
++# --------------------------------------------------------------------------- #
++
++
++def main(argv: Optional[Sequence[str]] = None) -> int:
++    ap = argparse.ArgumentParser(prog="python -m flydsl.compiler.asm_contract", description=__doc__.split("\n\n")[0])
++    sub = ap.add_subparsers(dest="cmd", required=True)
++    p = sub.add_parser("pack", help="assemble, audit and package a fragment")
++    p.add_argument("manifest")
++    p.add_argument("-o", "--out-dir", required=True)
++    p.add_argument("--llvm-dir", default=None)
++    a = ap.parse_args(argv)
++    try:
++        info = pack(a.manifest, a.out_dir, llvm_dir=a.llvm_dir)
++    except ContractError as exc:
++        print(f"error: {exc}", file=sys.stderr)
++        return 1
++    for w in info["warnings"]:
++        print(f"warning: {w}", file=sys.stderr)
++    fpw = info["footprint"]["writes"]
++    print(
++        f"{info['name']}: {info['fragment_bytes']} bytes, params "
++        + ", ".join(f"{p['name']}@{p['reg']}" for p in info["params"])
++        + f"; clobber {info['clobber']} ({fpw['num_sgpr']} SGPR, {fpw['num_vgpr']} VGPR written)"
++    )
++    print(f"  -> {Path(a.out_dir) / info['bitcode']}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/python/flydsl/compiler/external_llvm.py b/python/flydsl/compiler/external_llvm.py
+index 69993a74..58bf7898 100644
+--- a/python/flydsl/compiler/external_llvm.py
++++ b/python/flydsl/compiler/external_llvm.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ 
+ import hashlib
+ import os
++import re
+ import subprocess
+ import tempfile
+ from functools import lru_cache
+@@ -101,7 +102,9 @@ def _symbol_name(op: ir.Operation) -> str:
+         raise ExternalLLVMError(f"{op.name} is missing a string sym_name attribute.") from exc
+ 
+ 
+-def _replace_gpu_module_with_binary_op(module: ir.Module, external_binary_module: ir.Module) -> None:
++def _replace_gpu_module_with_binary_op(
++    module: ir.Module, external_binary_module: ir.Module, offloading_handler: Optional[ir.Attribute] = None
++) -> None:
+     gpu_module = _single_top_level_op(module, "gpu.module")
+     gpu_binary = _single_top_level_op(external_binary_module, "gpu.binary")
+ 
+@@ -112,10 +115,18 @@ def _replace_gpu_module_with_binary_op(module: ir.Module, external_binary_module
+             f"External LLVM produced gpu.binary @{binary_name}, but bundled module contains gpu.module @{module_name}."
+         )
+ 
+-    ir.InsertionPoint(gpu_module).insert(gpu_binary.clone())
++    binary = gpu_binary.clone()
++    if offloading_handler is not None:
++        binary.attributes["offloadingHandler"] = offloading_handler
++    ir.InsertionPoint(gpu_module).insert(binary)
+     gpu_module.erase()
+ 
+ 
++def _is_foreign_attr(attr: ir.Attribute) -> bool:
++    """True for attributes of FlyDSL dialects, which external MLIR cannot parse."""
++    return str(attr).startswith("#fly.")
++
++
+ def run_external_binary_codegen(
+     module: ir.Module,
+     binary_fragment: str,
+@@ -132,7 +143,9 @@ def run_external_binary_codegen(
+     """
+ 
+     prefix = _llvm_dir()
+-    mlir_opt = _tool(prefix, "mlir-opt")
++    handoff = env.compile.llvm_handoff.strip() or "mlir"
++    if handoff not in ("mlir", "llvm"):
++        raise ExternalLLVMError(f"FLYDSL_COMPILE_LLVM_HANDOFF must be 'mlir' or 'llvm', got {handoff!r}")
+     pipeline = f"builtin.module({binary_fragment})"
+ 
+     tmp_dir_obj = None
+@@ -144,6 +157,16 @@ def run_external_binary_codegen(
+ 
+     llvm_cli_args = _format_llvm_cli_options(llvm_options) if llvm_options else []
+ 
++    if handoff == "llvm":
++        try:
++            _run_llvm_ir_handoff(module, binary_fragment, prefix, llvm_cli_args, work_dir, stage_prefix)
++        finally:
++            if tmp_dir_obj is not None:
++                tmp_dir_obj.cleanup()
++        return
++
++    mlir_opt = _tool(prefix, "mlir-opt")
++
+     input_path = work_dir / f"{stage_prefix}_input.mlir"
+     external_output_path = work_dir / f"{stage_prefix}_external_output.mlir"
+     output_path = work_dir / f"{stage_prefix}_output.mlir"
+@@ -187,7 +210,16 @@ def run_external_binary_codegen(
+     gpu_module_op = _single_top_level_op(module, "gpu.module")
+     wrapper = ir.Module.create(loc=ir.Location.unknown(module.context))
+     wrapper.operation.attributes["gpu.container_module"] = ir.UnitAttr.get(module.context)
+-    ir.InsertionPoint.at_block_begin(wrapper.body).insert(gpu_module_op.operation.clone())
++    gpu_module_clone = gpu_module_op.operation.clone()
++    ir.InsertionPoint.at_block_begin(wrapper.body).insert(gpu_module_clone)
++    # Extern-linked kernels load through a FlyDSL offloading handler. The
++    # external tool only produces the binary; restore the handler afterwards.
++    offloading_handler = None
++    if "offloadingHandler" in gpu_module_clone.attributes:
++        handler = gpu_module_clone.attributes["offloadingHandler"]
++        if _is_foreign_attr(handler):
++            offloading_handler = handler
++            del gpu_module_clone.attributes["offloadingHandler"]
+     input_path.write_text(wrapper.operation.get_asm(enable_debug_info=env.debug.enable_debug_info), encoding="utf-8")
+ 
+     try:
+@@ -197,10 +229,91 @@ def run_external_binary_codegen(
+         external_binary_module = ir.Module.parse(
+             external_output_path.read_text(encoding="utf-8"), context=module.context
+         )
+-        _replace_gpu_module_with_binary_op(module, external_binary_module)
++        _replace_gpu_module_with_binary_op(module, external_binary_module, offloading_handler)
+         output_path.write_text(
+             module.operation.get_asm(enable_debug_info=env.debug.enable_debug_info), encoding="utf-8"
+         )
+     finally:
+         if tmp_dir_obj is not None:
+             tmp_dir_obj.cleanup()
++
++
++def _run_tool(prefix: Path, cmd: list, work_dir: Path) -> None:
++    cmd = [str(c) for c in cmd]
++    try:
++        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600, env=_subprocess_env(prefix))
++    except subprocess.TimeoutExpired as exc:
++        raise ExternalLLVMError(
++            f"External LLVM codegen timed out after 600s.\ncommand: {' '.join(cmd)}\nwork_dir: {work_dir}"
++        ) from exc
++    except subprocess.CalledProcessError as exc:
++        raise ExternalLLVMError(
++            "External LLVM codegen failed.\n"
++            f"llvm_dir: {prefix}\n"
++            f"command: {' '.join(cmd)}\n"
++            f"work_dir: {work_dir}\n"
++            f"stdout:\n{exc.stdout}\n"
++            f"stderr:\n{exc.stderr}"
++        ) from exc
++
++
++def _run_llvm_ir_handoff(
++    module: ir.Module,
++    binary_fragment: str,
++    prefix: Path,
++    llvm_cli_args: list,
++    work_dir: Path,
++    stage_prefix: str,
++) -> None:
++    """Bundled MLIR emits linked, optimized LLVM bitcode; external llc + ld.lld build the binary.
++
++    LLVM IR crosses nearby LLVM versions far better than MLIR dialect syntax,
++    so the external LLVM need not match the bundled MLIR.
++    """
++    from .._mlir.dialects import gpu
++    from .._mlir.passmanager import PassManager
++
++    llc = _tool(prefix, "llc")
++    lld = _tool(prefix, "ld.lld")
++
++    fragment, n = re.subn(r"format=\w+", "format=llvm", binary_fragment)
++    if n != 1:
++        raise ExternalLLVMError(f"Cannot select LLVM IR output in binary pipeline fragment: {binary_fragment}")
++    pm = PassManager.parse(f"builtin.module({fragment})", context=module.context)
++    pm.run(module.operation)
++
++    binary = _single_top_level_op(module, "gpu.binary")
++    objects = ir.ArrayAttr(binary.attributes["objects"])
++    if len(objects) != 1:
++        raise ExternalLLVMError(f"Expected one gpu.object, found {len(objects)}.")
++    obj = gpu.ObjectAttr(objects[0])
++    target = str(obj.target)
++    chip = re.search(r'chip = "([^"]+)"', target)
++    if chip is None:
++        raise ExternalLLVMError(f"Cannot find the chip in target {target}")
++    features = re.search(r'features = "([^"]*)"', target)
++    opt_level = re.search(r"\bO = (\d)", target)
++
++    bitcode = work_dir / f"{stage_prefix}.bc"
++    isa = work_dir / f"{stage_prefix}.o"
++    hsaco = work_dir / f"{stage_prefix}.hsaco"
++    bitcode.write_bytes(obj.object)
++    llc_cmd = [
++        llc,
++        bitcode,
++        "-mtriple=amdgcn-amd-amdhsa",
++        f"-mcpu={chip.group(1)}",
++        f"-O{opt_level.group(1) if opt_level else 2}",
++        "-filetype=obj",
++        "-o",
++        isa,
++        *([f"-mattr={features.group(1)}"] if features and features.group(1) else []),
++        *llvm_cli_args,
++    ]
++    _run_tool(prefix, llc_cmd, work_dir)
++    _run_tool(prefix, [lld, "-shared", isa, "-o", hsaco], work_dir)
++
++    new_obj = gpu.ObjectAttr.get(
++        obj.target, int(gpu.CompilationTarget.Binary), hsaco.read_bytes(), obj.properties, None
++    )
++    binary.attributes["objects"] = ir.ArrayAttr.get([new_obj], context=module.context)
+diff --git a/python/flydsl/compiler/jit_function.py b/python/flydsl/compiler/jit_function.py
+index 7ce31490..3258e3f4 100644
+--- a/python/flydsl/compiler/jit_function.py
++++ b/python/flydsl/compiler/jit_function.py
+@@ -824,21 +824,21 @@ class MlirCompiler:
+         llvm_opts = cfg.llvm_opts
+         external_binary = cfg.external
+ 
+-        if external_binary and link_libs:
+-            raise RuntimeError(
+-                "FLYDSL_COMPILE_LLVM_DIR external codegen does not support extern link_libs yet; "
+-                "use embedded codegen for kernels that require #fly.explicit_module."
+-            )
+-
+         if link_libs:
+             link_opt = _format_link_lib_options(link_libs)
+             fragments, found_attach_target = _append_link_lib_options_to_attach_targets(fragments, link_opt)
+             if not found_attach_target:
+                 raise RuntimeError("link_libs specified but no attach-target fragment found in pipeline")
++            if external_binary:
++                # The external mlir-opt links the libraries named by the target
++                # attribute that the pre-binary pipeline attaches.
++                pre_binary_fragments, _ = _append_link_lib_options_to_attach_targets(pre_binary_fragments, link_opt)
+ 
+         from .llvm_options import llvm_options as _llvm_options
+ 
+-        _llvm_ctx = _llvm_options(llvm_opts) if llvm_opts else nullcontext()
++        # In external mode the options are passed to the external mlir-opt,
++        # which may know options that the bundled LLVM does not.
++        _llvm_ctx = _llvm_options(llvm_opts) if llvm_opts and not external_binary else nullcontext()
+ 
+         if env.debug.print_origin_ir:
+             log().info(f"Origin IR: \n{module}")
+@@ -1526,11 +1526,6 @@ class JitFunction:
+         link_libs = list(comp_ctx.link_libs) if comp_ctx.link_libs else None
+         post_load_processors = list(comp_ctx.post_load_processors)
+         extern_linked = bool(link_libs or post_load_processors)
+-        if extern_linked and _use_external_binary_codegen():
+-            raise RuntimeError(
+-                "FLYDSL_COMPILE_LLVM_DIR external codegen does not support extern-linked kernels yet; "
+-                "use embedded codegen for kernels that require #fly.explicit_module."
+-            )
+         if extern_linked:
+             gpu_module.offloadingHandler = ir.Attribute.parse("#fly.explicit_module")
+             if "targets" in gpu_module.operation.attributes:
+diff --git a/python/flydsl/expr/extern.py b/python/flydsl/expr/extern.py
+index 0ba07e84..172f599e 100644
+--- a/python/flydsl/expr/extern.py
++++ b/python/flydsl/expr/extern.py
+@@ -61,6 +61,7 @@ class ExternFunction:
+         is_pure: bool = False,
+         bitcode_path: Optional[str] = None,
+         module_init_fn: Optional[Any] = None,
++        convergent: bool = False,
+     ):
+         if bitcode_path is not None or module_init_fn is not None:
+             raise TypeError(
+@@ -73,6 +74,7 @@ class ExternFunction:
+         self._arg_type_names = list(arg_types)
+         self._ret_type_name = ret_type
+         self.is_pure = is_pure
++        self.convergent = convergent
+ 
+     def _resolve_types(self) -> tuple:
+         arg_types = [_resolve_type(t) for t in self._arg_type_names]
+@@ -174,19 +176,17 @@ class ExternFunction:
+         if ret_type is None:
+             from .._mlir.ir import Operation
+ 
+-            Operation.create(
+-                "llvm.call",
+-                results=[],
+-                operands=raw_args,
+-                attributes={
+-                    "callee": callee_ref,
+-                    "operandSegmentSizes": DenseI32ArrayAttr.get([len(raw_args), 0]),
+-                    "op_bundle_sizes": no_bundle,
+-                    "CConv": Attribute.parse("#llvm.cconv<ccc>"),
+-                    "TailCallKind": Attribute.parse("#llvm.tailcallkind<none>"),
+-                    "fastmathFlags": Attribute.parse("#llvm.fastmath<none>"),
+-                },
+-            )
++            attributes = {
++                "callee": callee_ref,
++                "operandSegmentSizes": DenseI32ArrayAttr.get([len(raw_args), 0]),
++                "op_bundle_sizes": no_bundle,
++                "CConv": Attribute.parse("#llvm.cconv<ccc>"),
++                "TailCallKind": Attribute.parse("#llvm.tailcallkind<none>"),
++                "fastmathFlags": Attribute.parse("#llvm.fastmath<none>"),
++            }
++            if self.convergent:
++                attributes["convergent"] = ir.UnitAttr.get()
++            Operation.create("llvm.call", results=[], operands=raw_args, attributes=attributes)
+             return None
+ 
+         call = llvm.CallOp(
+@@ -196,6 +196,8 @@ class ExternFunction:
+             no_bundle,
+             callee=callee_ref,
+         )
++        if self.convergent:
++            call.operation.attributes["convergent"] = ir.UnitAttr.get()
+         return call.result
+ 
+     def __repr__(self) -> str:
+diff --git a/python/flydsl/utils/env.py b/python/flydsl/utils/env.py
+index a229d9ae..0f785d19 100644
+--- a/python/flydsl/utils/env.py
++++ b/python/flydsl/utils/env.py
+@@ -238,6 +238,11 @@ class CompileEnvManager(EnvManager):
+     arch = OptStr("", env_var="ARCH", description="Override target GPU architecture (e.g. gfx942, gfx950)")
+     backend = OptStr("rocm", description="GPU compile backend id (e.g. rocm)")
+     llvm_dir = OptStr("", description="External LLVM/MLIR install prefix for final code generation")
++    llvm_handoff = OptStr(
++        "mlir",
++        description="What external LLVM receives: 'mlir' (its mlir-opt runs gpu-module-to-binary) or "
++        "'llvm' (bundled MLIR links and optimizes LLVM IR; external llc and ld.lld build the binary)",
++    )
+ 
+ 
+ class DebugEnvManager(EnvManager):
+diff --git a/tests/unit/test_asm_contract.py b/tests/unit/test_asm_contract.py
+new file mode 100644
+index 00000000..85e051af
+--- /dev/null
++++ b/tests/unit/test_asm_contract.py
+@@ -0,0 +1,175 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 FlyDSL Project Contributors
++
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++from flydsl.compiler.asm_contract import (
++    ContractError,
++    Manifest,
++    _generate_ll,
++    check_footprint,
++    format_regs,
++    pack,
++    parse_regs,
++    spill_hints,
++)
++
++pytestmark = [pytest.mark.l1b_target_dialect, pytest.mark.rocm_lower]
++
++
++def _manifest(**overrides):
++    data = {
++        "name": "frag",
++        "source": "frag.s",
++        "params": [
++            {"name": "args", "reg": "s[0:1]", "type": "uint64"},
++            {"name": "lane", "reg": "v0", "type": "uint32"},
++            {"name": "wave", "reg": "s24", "type": "uint32"},
++        ],
++        "preserves": ["exec", "mode"],
++    }
++    data.update(overrides)
++    return Manifest.from_dict(data, base=Path("/tmp"))
++
++
++def _footprint(sgpr="s[2:5]", vgpr="v[4:7]", special=("scc",), **extra):
++    fp = {
++        "writes": {"sgpr": sgpr, "vgpr": vgpr, "special": list(special), "num_sgpr": 0, "num_vgpr": 0},
++        "reads": {"sgpr": "s[0:1]", "vgpr": "v0", "special": [], "num_sgpr": 0, "num_vgpr": 0},
++        "forbidden": [],
++        "has_relocations": False,
++        "vgpr_msb_exit": 0,
++        "warnings": [],
++        "instructions": 4,
++    }
++    fp.update(extra)
++    return fp
++
++
++def test_parse_and_format_register_sets():
++    regs = parse_regs(["s[2:4]", "s5", "v[300:301]", "SCC", " memory "])
++    assert ("s", 2) in regs and ("s", 5) in regs and ("v", 301) in regs
++    assert {"scc", "memory"} <= regs
++    assert format_regs(regs) == "s[2:5],v[300:301],memory,scc"
++    assert parse_regs("v1, v3") == {("v", 1), ("v", 3)}
++    with pytest.raises(ContractError, match="bad register range"):
++        parse_regs(["v[5:4]"])
++
++
++@pytest.mark.parametrize(
++    "param, message",
++    [
++        ({"name": "a", "reg": "s[1:2]", "type": "uint64"}, "even SGPR"),
++        ({"name": "a", "reg": "v[0:2]", "type": "uint64"}, "one or two"),
++        ({"name": "a", "reg": "v0", "type": "uint64"}, "does not fit"),
++        ({"name": "a", "reg": "v0", "type": "float32"}, "type must be one of"),
++    ],
++)
++def test_manifest_rejects_bad_params(param, message):
++    with pytest.raises(ContractError, match=message):
++        _manifest(params=[param])
++
++
++def test_manifest_rejects_unknown_keys():
++    with pytest.raises(ContractError, match="unknown manifest keys"):
++        _manifest(clobber=["v1"])
++
++
++def test_clobber_defaults_to_footprint_minus_preserved():
++    clobber, warnings = check_footprint(_manifest(), _footprint(special=("scc", "exec", "mode")))
++    assert clobber == "s[2:5],v[4:7],scc"
++    assert warnings == []
++
++
++@pytest.mark.parametrize(
++    "overrides, footprint, message",
++    [
++        ({"clobbers": ["s[2:4]", "v[4:7]", "scc"]}, {}, "writes s5, which is not in clobbers"),
++        ({}, {"vgpr": "v0,v[4:7]"}, r"writes input register\(s\) v0"),
++        ({"preserves": []}, {"special": ("scc", "exec")}, "changes exec"),
++        ({}, {"forbidden": [{"offset": 8, "opcode": "S_ENDPGM_gfx12"}]}, "S_ENDPGM_gfx12@8"),
++        ({}, {"vgpr_msb_exit": 0x40}, "VGPR MSBs 0x40"),
++        ({}, {"has_relocations": True}, "relocations"),
++    ],
++)
++def test_check_footprint_errors(overrides, footprint, message):
++    extra = {k: footprint.pop(k) for k in list(footprint) if k in ("forbidden", "vgpr_msb_exit", "has_relocations")}
++    with pytest.raises(ContractError, match=message):
++        check_footprint(_manifest(**overrides), _footprint(**footprint, **extra))
++
++
++def test_overdeclared_clobbers_warn():
++    clobber, warnings = check_footprint(_manifest(clobbers=["s[2:5]", "v[4:15]", "scc"]), _footprint())
++    assert clobber == "s[2:5],v[4:15],scc"
++    assert any("v[8:15]" in w for w in warnings)
++
++
++def test_generated_contract_function():
++    ll = _generate_ll(_manifest(align=64), [0xBF800000, 0xBF800001], "s[2:5],v[4:7],scc")
++    assert (
++        'define void @frag(i64 "amdgpu-reg"="s[0:1]" %args, i32 "amdgpu-reg"="v0" %lane, '
++        'i32 "amdgpu-reg"="s24" %wave) #0' in ll
++    )
++    # Uniform SGPR inputs are made legal for an SGPR; VGPR inputs pass through.
++    assert "@llvm.amdgcn.readfirstlane.i64(i64 %args)" in ll
++    assert "@llvm.amdgcn.readfirstlane.i32(i32 %wave)" in ll
++    assert "readfirstlane.i32(i32 %lane)" not in ll
++    assert "s_branch 1f\\0A.p2align 6\\0A1:\\0A.long 0xbf800000\\0A.long 0xbf800001\\0A" in ll
++    assert '"{s[0:1]},{v0},{s24},~{s[2:5]},~{v[4:7]},~{scc},~{memory}"' in ll
++    assert '"amdgpu-contract"="frag" "amdgpu-contract-clobber"="s[2:5],v[4:7],scc"' in ll
++    assert "noinline convergent" in ll
++
++
++def test_spill_hints():
++    assert spill_hints() == {"amdgpu-spill-policy": "error", "amdgpu-sgpr-lane-spill-max": 0}
++    assert spill_hints("allow", sgpr_lane_spill_max=4, report="r.jsonl")["amdgpu-contract-report"] == "r.jsonl"
++    with pytest.raises(ValueError):
++        spill_hints("strict")
++
++
++_LLVM_DIR = os.environ.get("FLYDSL_TEST_CONTRACT_LLVM_DIR", "")
++
++
++@pytest.mark.skipif(not _LLVM_DIR, reason="set FLYDSL_TEST_CONTRACT_LLVM_DIR to an LLVM with the contract passes")
++def test_pack_real_fragment(tmp_path):
++    src = tmp_path / "frag.s"
++    src.write_text(
++        """  .text
++  .globl frag
++  .type frag,@function
++frag:
++  s_load_b32 s2, s[0:1], 0x0
++  s_wait_kmcnt 0
++  v_add_nc_u32 v4, s2, v0
++  s_set_vgpr_msb 0x40
++  v_mov_b32 v1, v4
++  s_set_vgpr_msb 0
++  .size frag, .-frag
++""",
++        encoding="utf-8",
++    )
++    manifest = tmp_path / "frag.json"
++    manifest.write_text(
++        json.dumps(
++            {
++                "name": "frag",
++                "source": "frag.s",
++                "symbol": "frag",
++                "params": [
++                    {"name": "args", "reg": "s[0:1]", "type": "uint64"},
++                    {"name": "lane", "reg": "v0", "type": "uint32"},
++                ],
++            }
++        ),
++        encoding="utf-8",
++    )
++    info = pack(manifest, tmp_path / "out", llvm_dir=_LLVM_DIR)
++    # v1 written with the dst MSB set is v257.
++    assert info["clobber"] == "s2,v4,v257"
++    assert (tmp_path / "out" / "frag.contract.bc").read_bytes()[:2] == b"BC"
++    sidecar = json.loads((tmp_path / "out" / "frag.contract.json").read_text(encoding="utf-8"))
++    assert sidecar["bitcode"] == "frag.contract.bc" and sidecar["fragment_bytes"] > 0
+diff --git a/tests/unit/test_external_llvm_codegen.py b/tests/unit/test_external_llvm_codegen.py
+index 238b3f13..b342ffc1 100644
+--- a/tests/unit/test_external_llvm_codegen.py
++++ b/tests/unit/test_external_llvm_codegen.py
+@@ -247,3 +247,81 @@ def test_format_llvm_cli_options():
+     # is cl::opt<cl::boolOrDefault>, so `=4` is rejected by LLVM itself.
+     assert _format_llvm_cli_options({"amdgpu-schedule-metric-bias": 25}) == ["--amdgpu-schedule-metric-bias=25"]
+     assert _format_llvm_cli_options({}) == []
++
++
++def _make_fake_llvm_codegen_tools(tmp_path: Path) -> Path:
++    """Fake llc / ld.lld that record argv and write a recognizable object."""
++    prefix = tmp_path / "llvm-ir"
++    bin_dir = prefix / "bin"
++    bin_dir.mkdir(parents=True)
++    script = r"""#!/usr/bin/env python3
++import json
++import pathlib
++import sys
++
++out = pathlib.Path(sys.argv[sys.argv.index("-o") + 1])
++out.with_suffix(out.suffix + ".argv.json").write_text(json.dumps(sys.argv), encoding="utf-8")
++out.write_bytes(b"\x7fELF" + b"%s")
++"""
++    _write_executable(bin_dir / "llc", script % "llc")
++    _write_executable(bin_dir / "ld.lld", script % "lld")
++    return prefix
++
++
++def test_llvm_handoff_runs_external_llc_and_lld(tmp_path, monkeypatch):
++    """FLYDSL_COMPILE_LLVM_HANDOFF=llvm: bundled MLIR emits LLVM IR, external llc + ld.lld link it."""
++    llvm_dir = _make_fake_llvm_codegen_tools(tmp_path)
++    monkeypatch.setenv("FLYDSL_COMPILE_LLVM_DIR", str(llvm_dir))
++    monkeypatch.setenv("FLYDSL_COMPILE_LLVM_HANDOFF", "llvm")
++
++    with _create_mlir_context() as ctx, ir.Location.unknown(ctx):
++        module = ir.Module.parse(_MODULE_WITH_HOST.replace('chip = "gfx942"', 'O = 3, chip = "gfx942"'), context=ctx)
++        run_external_binary_codegen(
++            module,
++            'gpu-module-to-binary{format=fatbin opts=""}',
++            llvm_options={"amdgpu-spill-policy": "error"},
++            work_dir=tmp_path / "work",
++            stage_prefix="handoff",
++        )
++        result = module.operation.get_asm()
++        module.operation.verify()
++
++    assert 'bin = "\\7FELFlld"' in result
++    assert "gpu.module @kernels" not in result
++    assert "llvm.func @host" in result
++    # The bundled MLIR's LLVM bitcode is what external llc compiles.
++    assert (tmp_path / "work" / "handoff.bc").read_bytes()[:2] == b"BC"
++    llc_argv = json.loads((tmp_path / "work" / "handoff.o.argv.json").read_text(encoding="utf-8"))
++    assert str(tmp_path / "work" / "handoff.bc") in llc_argv
++    assert "-mcpu=gfx942" in llc_argv and "-O3" in llc_argv and "-filetype=obj" in llc_argv
++    assert "--amdgpu-spill-policy=error" in llc_argv
++    lld_argv = json.loads((tmp_path / "work" / "handoff.hsaco.argv.json").read_text(encoding="utf-8"))
++    assert "-shared" in lld_argv and str(tmp_path / "work" / "handoff.o") in lld_argv
++
++
++def test_llvm_handoff_rejects_unknown_mode(tmp_path, monkeypatch):
++    monkeypatch.setenv("FLYDSL_COMPILE_LLVM_DIR", str(_make_fake_llvm(tmp_path)))
++    monkeypatch.setenv("FLYDSL_COMPILE_LLVM_HANDOFF", "asm")
++    with ir.Context() as ctx, ir.Location.unknown(ctx):
++        ctx.load_all_available_dialects()
++        module = ir.Module.parse(_MODULE_WITH_HOST, context=ctx)
++        with pytest.raises(Exception, match="FLYDSL_COMPILE_LLVM_HANDOFF"):
++            run_external_binary_codegen(module, 'gpu-module-to-binary{format=fatbin opts=""}', work_dir=tmp_path / "w")
++
++
++def test_fly_offloading_handler_is_hidden_from_external_mlir_opt(tmp_path, monkeypatch):
++    """Extern-linked kernels: #fly.explicit_module never reaches external MLIR and is restored."""
++    llvm_dir = _make_fake_llvm(tmp_path)
++    monkeypatch.setenv("FLYDSL_COMPILE_LLVM_DIR", str(llvm_dir))
++
++    with _create_mlir_context() as ctx, ir.Location.unknown(ctx):
++        module = ir.Module.parse(_MODULE_WITH_HOST, context=ctx)
++        gpu_module = next(op.operation for op in module.body.operations if op.operation.name == "gpu.module")
++        gpu_module.attributes["offloadingHandler"] = ir.Attribute.parse("#fly.explicit_module")
++        run_external_binary_codegen(
++            module, 'gpu-module-to-binary{format=fatbin opts=""}', work_dir=tmp_path / "work", stage_prefix="h"
++        )
++        result = module.operation.get_asm()
++
++    assert "#fly." not in (tmp_path / "work" / "h_input.mlir").read_text(encoding="utf-8")
++    assert "gpu.binary @kernels <#fly.explicit_module>" in result

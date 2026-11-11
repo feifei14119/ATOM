@@ -4,6 +4,14 @@
 **目标硬件：** gfx1250（MI455X），wave32，每个 wave 最多 1024 个 VGPR（v256 以上需要 `s_set_vgpr_msb` 寻址）。
 **使用方：** ATOM DeepSeek V4.1 mono kernel，计划把 GEMM / attention / MoE 等关键算子替换为手写 ASM，后续还会不断接入新的 ASM。
 
+> **实现状态（2026-11）：** P1–P5 已实现，并在 gfx1250 上用 `mono_test_contract` 端到端验证（scratch 0、无 spill、无 `s_swap_pc`，A/B 逐位一致）。详见 [ASM_REG_CONTRACT_IMPLEMENTATION.zh-CN.md](ASM_REG_CONTRACT_IMPLEMENTATION.zh-CN.md)。与本文设计的主要差异：
+>
+> - 契约用函数和参数属性表达，**没有新增 `amdgpu_contract` 调用约定**（5.1 节）；
+> - 只实现了 `inline` 降级，`call` 降级和 HIP 属性留在 P6；
+> - 打包工具是 `amdgpu-asm-footprint` 加 `python -m flydsl.compiler.asm_contract pack`，不是 `amdgpu-asm-pack`；
+> - spill 策略和上限通过 llc 选项（`spill_hints()`）传入，不是第 6.2 节的 compile hint 键；
+> - 返回值绑定、LDS 和 waitcnt 契约、寄存器分配前的估算尚未实现。
+
 ## 0. 一句话需求
 
 保留 `mono_test00` 的接入形态：ASM 由提供方**单独打包成 bitcode 里的一个函数**，FlyDSL 通过 `ffi + link_extern` **像调用函数一样调用它**，mono 主体里不写任何 asm。在此基础上满足三点：
@@ -404,4 +412,5 @@ P1–P3 是在 inline asm 层面就有用的通用能力，P4 在其上实现契
 - 现有接入方案对比：[ASM_MONO_INTEGRATION.zh-CN.md](ASM_MONO_INTEGRATION.zh-CN.md)、[ASM_FLYDSL_MONO_INTEGRATION_OPTIONS.zh-CN.md](ASM_FLYDSL_MONO_INTEGRATION_OPTIONS.zh-CN.md)
 - `mono_test00` 的包装器与 clobber 声明：`../mono_test00/asm/dq_wrapper.cpp`、`../mono_test00/asm/dq_convert_inline.h`、`../mono_test00/mono1250/kernels/dq_ffi.py`
 - 实现所用的 LLVM 源码：`/app/llvm-project`（ROCm `amd-staging` 的 `d177931e65e6`，分支 `asm-reg-contract`，基线已编译在 `build/`）
-- FlyDSL 相关接口：`flydsl/compiler/extern_link.py`（`link_extern`）、`flydsl/compiler/external_llvm.py`、`flydsl/compiler/jit_function.py:829,1531`
+- FlyDSL 相关接口：`flydsl/compiler/extern_link.py`（`link_extern`）、`flydsl/compiler/external_llvm.py`、`flydsl/compiler/jit_function.py`（E7 所指的两处拒绝已在 `/app/FlyDSL` 分支 `asm-reg-contract` 中移除）
+- 实现与验证：[ASM_REG_CONTRACT_IMPLEMENTATION.zh-CN.md](ASM_REG_CONTRACT_IMPLEMENTATION.zh-CN.md)、补丁 [asm_reg_contract_patches/](asm_reg_contract_patches/)、端到端用例 `../mono_test_contract/`

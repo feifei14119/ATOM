@@ -1,0 +1,1016 @@
+/*******************************************************************************
+ *                      MXFP8_GEMM_1TG_4W_128mx2_128nx2
+ *
+ * Design   Author: Zhang,Niels; Zheng,Huan
+ * HostCode Author: Zheng,Huan; Zhu,Wei
+ * Kernel   Author: Zheng,Huan; Zhu,Wei
+ *
+ ******************************************************************************/
+
+/**
+ * User input parameters
+ *
+ *  name               size  offset     description                        sreg in kernel
+ * ---------------------------------------------------------------------------------------
+ *   D                   8   0x0     Matrix D address                        _s_D_buf
+ *   A                   8   0x10    Matrix A address                        _s_A_buf
+ *   B                   8   0x20    Matrix B address                        _s_B_buf
+ *   A Scale             8   0x30    A Scale address                         _s_AS_buf
+ *   B Scale             8   0x40    B Scale address                         _s_BS_buf
+ *   Stride of D         4   0x50    Stride of D in units of bytes           _s_D_strd
+ *   Stride of A         4   0x60    Stride of A in units of bytes           _s_A_strd
+ *   Stride of B         4   0x70    Stride of B in units of bytes           _s_B_strd
+ *   Stride of A Scale   4   0x80    Stride of A Scale in units of bytes     _s_AS_strd
+ *   Stride of B Scale   4   0x90    Stride of B Scale in units of bytes     _s_BS_strd
+ *   M                   4   0xA0    M in units of elements                  _s_M
+ *   N                   4   0xB0    N in units of elements                  _s_N
+ *   K                   4   0xC0    K in units of elements                  _s_K
+ */
+
+/**
+ * SPI input
+ *
+ * spi_set_reg       description              reg in kernel
+ * -----------------------------------------------------------------------
+ *   v0             thread id x/y/z              v0,v1,v2
+ * -----------------------------------------------------------------------
+ * The following grid must be consistent with host opencl code
+ * 1. grid_x        = N / (CLUSTER_N * TILE_N)
+ * 2. grid_y        = M / (CLUSTER_M * TILE_M)
+ * 3. grid_z        = 1
+ * 4. wg_x          = CLUSTER_N
+ * 5. wg_y          = CLUSTER_M
+ * 6. wg_z          = 1
+ * 7. local_size_x  = 32
+ * 8. local_size_y  = 1
+ * 9. local_size_z  = 1
+ */
+
+
+
+
+var AM              = 0
+var DEBUG           = 1
+var ENABLE_CLUSTER  = 0
+var PREFETCH_INST   = 1
+var PREFETCH_PTL    = 1
+
+
+var CLUSTER_M   = 1
+var CLUSTER_N   = 1
+var TILE_M      = 256
+var TILE_N      = 256
+var TILE_K      = 128
+var PF_TILES    = 4
+
+var WAVES     = 4
+var BLOCK_M   = TILE_M / 2
+var BLOCK_N   = TILE_N / 2
+var SUB_M     = BLOCK_M / 2
+var SUB_N     = BLOCK_N / 2
+var SUB_K     = TILE_K
+
+var MMA_M    = 16
+var MMA_N    = 16
+var MMA_K    = 128
+var ACC_M    = SUB_M / MMA_M
+var ACC_N    = SUB_N / MMA_N
+var ACC_K    = SUB_K / MMA_K
+
+
+var LDS_A_PAD_INTERVAL  = 128
+var LDS_A_PAD_AMOUNT    = 16
+var LDS_D_PAD_AMOUNT    = 16
+
+var LDS_A_TILE_SIZE   = TILE_M * (TILE_K + LDS_A_PAD_AMOUNT)
+var LDS_B_TILE_SIZE   = TILE_N * TILE_K
+var LDS_AS_TILE_SIZE  = TILE_M * TILE_K / 32
+var LDS_BS_TILE_SIZE  = TILE_N * TILE_K / 32
+
+var LDS_AS_BASE   = 0
+var LDS_A_BASE    = LDS_AS_BASE + LDS_AS_TILE_SIZE * 4
+var LDS_BS_BASE   = LDS_A_BASE + LDS_A_TILE_SIZE * 4
+var LDS_B_BASE    = 192 * 1024
+
+
+var TILE_A_DIM0   = TILE_K
+var TILE_A_DIM1   = TILE_M
+var TILE_B_DIM0   = TILE_K * 16
+var TILE_B_DIM1   = TILE_N / 16
+var TILE_AS_DIM0  = (TILE_K / 32) * 32
+var TILE_AS_DIM1  = TILE_M / 32
+var TILE_BS_DIM0  = (TILE_K / 32) * 32
+var TILE_BS_DIM1  = TILE_N / 32
+var TILE_D_DIM0   = BLOCK_N * 2 + LDS_D_PAD_AMOUNT
+var TILE_D_DIM1   = BLOCK_M
+
+
+var _s_G0            = 4
+var _s_G1            = _s_G0 + 4
+var _s_glb_addr      = _s_G1 + 8
+var _s_glb_addr_inc  = _s_glb_addr + 2
+var _s_tensor_dim0   = _s_glb_addr_inc + 2
+var _s_tensor_dim1   = _s_tensor_dim0 + 1
+var _s_tensor_strd   = _s_tensor_dim1 + 1
+
+var _s_D_buf     = _s_tensor_strd + 2
+var _s_A_buf     = _s_D_buf + 2
+var _s_B_buf     = _s_A_buf + 2
+var _s_AS_buf    = _s_B_buf + 2
+var _s_BS_buf    = _s_AS_buf + 2
+var _s_D_strd    = _s_BS_buf + 2
+var _s_A_strd    = _s_D_strd + 1
+var _s_B_strd    = _s_A_strd + 1
+var _s_AS_strd   = _s_B_strd + 1
+var _s_BS_strd   = _s_AS_strd + 1
+var _s_M         = _s_BS_strd + 1
+var _s_N         = _s_M + 1
+var _s_K         = _s_N + 1
+
+var _s_wvid            = _s_K + 1
+var _s_wgid_x          = _s_wvid + 1
+var _s_wgid_y          = _s_wgid_x + 1
+var _s_workgroup_mask  = _s_wgid_y + 1
+var _s_loop_cur        = _s_workgroup_mask + 1
+var _s_loop_end        = _s_loop_cur + 1
+var _s_tmp             = _s_loop_end + 1
+_s_tmp = (_s_tmp + 1) / 2 * 2
+
+var _s_end = _s_tmp + 4
+
+assert(_s_end <= 106)
+if DEBUG
+    print "Total SGPRs to be used (<106): ", _s_end
+end
+
+var NA      = -1
+var A0B0    = 0
+var A0B1    = 1
+var A1B0    = 2
+var A1B1    = 3
+var A0      = 0
+var A1      = 1
+var B0      = 2
+var B1      = 3
+
+var V_D_SIZE    = 128
+var V_A_SIZE    = 64
+var V_B_SIZE    = V_A_SIZE
+var V_AS_SIZE   = 2
+var V_BS_SIZE   = 2
+
+var _v_D      = 4
+var _v_A      = _v_D + V_D_SIZE
+var _v_B      = _v_A
+var _v_AS     = _v_B + V_B_SIZE
+var _v_BS     = _v_AS + V_AS_SIZE * 2
+var _v_tmp    = _v_BS + V_BS_SIZE * 2
+
+var _v_A_lds_rd   = _v_tmp + 4
+var _v_B_lds_rd   = _v_A_lds_rd + PF_TILES
+var _v_AS_lds_rd  = _v_B_lds_rd + PF_TILES
+var _v_BS_lds_rd  = _v_AS_lds_rd + 1
+var _v_D_lds_wr   = _v_BS_lds_rd + 1
+var _v_end        = _v_D_lds_wr + 1
+
+assert(_v_end <= 256)
+if DEBUG
+    print "Total VGPRs to be used in one portion (<256): ", _v_end
+end
+
+label label_core_loop_wave[WAVES]
+label label_output_results
+label label_skip_output_ptl_prefetch
+
+function set_sched_mode(mode)
+    s_setreg_imm32_b32   { id:HW_REG_WAVE_SCHED_MODE, offset:0, size:1 },  mode
+end
+
+function set_inst_prefetch(enable)
+    s_setreg_imm32_b32   { id:HW_REG_WAVE_MODE, offset:24, size:0 },  enable
+end
+
+function wgp_barrier
+    s_barrier_signal    -1
+    s_barrier_wait      -1
+end
+
+function cluster_barrier
+    s_barrier_signal    -3
+    s_barrier_wait      -3
+end
+
+function log2(num)
+    assert(num > 0)
+    var ret = 0
+    while (num >> 1)
+        num >>= 1
+        ret++
+    end
+    return ret
+end
+
+var VGPR_MSB = [0, 0, 0, 0]
+
+function set_vgpr_msb(wvid, msb_dst, msb_src0, msb_src1, msb_src2)
+    var msb_list = [msb_src0, msb_src1, msb_src2, msb_dst]
+
+    var cur_vgpr_msb = VGPR_MSB[wvid]
+    var new_vgpr_msb = 0
+
+    for var i = 0; i < 4; i++
+        var pos = i * 2
+        var msb = (msb_list[i] == NA) ? (cur_vgpr_msb >> pos) & 0x3 : msb_list[i]
+        new_vgpr_msb |= msb << pos
+    end
+
+    if cur_vgpr_msb != new_vgpr_msb
+        VGPR_MSB[wvid] = new_vgpr_msb
+        s_set_vgpr_msb      (cur_vgpr_msb << 8) | new_vgpr_msb
+    end
+end
+
+function sub_AB_to_msb(wvid, sub_AB)
+    if (wvid & 1) == 0
+        return [2, 1, 3, 0][sub_AB]
+    else
+        return [3, 0, 1, 2][sub_AB]
+    end
+end
+
+function msb_to_sub_AB(wvid, msb)
+    if (wvid & 1) == 0
+        return [B1, A1, A0, B0][msb]
+    else
+        return [A1, B0, B1, A0][msb]
+    end
+end
+
+function TDM_set_G0_lds_addr(wvid, tile)
+    if wvid == 0
+        s_mov_b32       s[_s_G0 + 1],  LDS_A_BASE + LDS_A_TILE_SIZE * tile
+    elsif wvid == 1
+        s_mov_b32       s[_s_G0 + 1],  LDS_B_BASE + LDS_B_TILE_SIZE * tile
+    elsif wvid == 2
+        s_mov_b32       s[_s_G0 + 1],  LDS_AS_BASE + LDS_AS_TILE_SIZE * tile
+    elsif wvid == 3
+        s_mov_b32       s[_s_G0 + 1],  LDS_BS_BASE + LDS_BS_TILE_SIZE * tile
+    else
+        assert(0)
+    end
+end
+
+function TDM_update_G0_glb_addr(ntiles, inst_idx)
+    if inst_idx == 0
+        s_add_co_u32        s[_s_tmp],  s[_s_loop_cur],  (ntiles + 1) * TILE_K
+    elsif inst_idx == 1
+        s_cmp_lt_u32        s[_s_tmp],  s[_s_loop_end]
+    elsif inst_idx == 2
+        s_cselect_b32       s[_s_glb_addr_inc],  s[_s_glb_addr_inc],  0
+    elsif inst_idx == 3
+        s_cselect_b32       s[_s_G1 + 2],  s[_s_G1 + 2],  0
+    elsif inst_idx == 4
+        s_cselect_b32       s[_s_G1 + 3],  s[_s_G1 + 3],  0
+    elsif inst_idx == 5
+        s_add_nc_u64        s[_s_G0 + 2],  s[_s_G0 + 2],  s[_s_glb_addr_inc]
+    else
+        assert(0)
+    end
+end
+
+var ITST_TDM_UPDATE_GLB_ADDR = 6
+function fused_TDM_update_G0_glb_addr(ntiles, inst_start, inst_num)
+    var inst_end = inst_start + inst_num > ITST_TDM_UPDATE_GLB_ADDR ? ITST_TDM_UPDATE_GLB_ADDR : inst_start + inst_num
+    for var i = inst_start; i < inst_end; i++
+        TDM_update_G0_glb_addr(ntiles, i)
+    end
+    return inst_end
+end
+
+function TDM_init_G0
+    s_mov_b32       s[_s_G0 + 0],   1
+    s_mov_b32       s[_s_G0 + 1],   0
+    s_mov_b32       s[_s_G0 + 3],   0x80000000
+
+
+    s_mov_b32       s[_s_G0 + 2],        s[_s_glb_addr]
+    s_and_b32       s[_s_glb_addr + 1],  s[_s_glb_addr + 1],  0x01ffffff
+    s_or_b32        s[_s_G0 + 3],        s[_s_G0 + 3],        s[_s_glb_addr + 1]
+end
+
+function TDM_G1_first_sgpr(wgp_mask, data_size, early_timeout, pad_enable, pad_interval, pad_amount)
+    var first_sgpr = 0
+    first_sgpr |= wgp_mask & 0xffff
+    first_sgpr |= (log2(data_size) & 0x3) << 16
+    first_sgpr |= (early_timeout & 0x1) << 21
+    first_sgpr |= (pad_enable & 0x1) << 20
+    if pad_enable
+        first_sgpr |= ((log2(pad_interval / 4) - 1) & 0x7) << 22
+        first_sgpr |= ((pad_amount / 4 - 1) & 0x7f) << 25
+    end
+    return first_sgpr
+end
+
+function TDM_init_G1(first_sgpr, tile_dim0, tile_dim1)
+    if ENABLE_CLUSTER
+        s_or_b32        s[_s_G1],  first_sgpr,  s[_s_workgroup_mask]
+    else
+        s_mov_b32       s[_s_G1],  first_sgpr
+    end
+
+    s_lshl_b32      s[_s_G1 + 1],   s[_s_tensor_dim0],  16
+    s_lshr_b32      s[_s_G1 + 2],   s[_s_tensor_dim0],  16
+
+    s_lshr_b32      s[_s_G1 + 3],   s[_s_tensor_dim1],  16
+    s_lshl_b32      s[_s_G1 + 6],   s[_s_tensor_dim1],  16
+    s_or_b32        s[_s_G1 + 2],   s[_s_G1 + 6],       s[_s_G1 + 2]
+
+    s_or_b32        s[_s_G1 + 3],  s[_s_G1 + 3],  (tile_dim0 & 0x0000ffff) << 16
+
+    s_mov_b32       s[_s_G1 + 4],  tile_dim1 & 0x0000ffff
+
+    s_mov_b32       s[_s_G1 + 5],  s[_s_tensor_strd]
+
+    s_mov_b32       s[_s_G1 + 6],   0
+    s_mov_b32       s[_s_G1 + 7],   0
+end
+
+function TDM_load
+    tensor_load_to_lds   s[_s_G0],  s[_s_G1],  null,  null
+end
+
+function TDM_store
+    tensor_store_from_lds   s[_s_G0],  s[_s_G1],  null,  null
+end
+
+function TDM_init_A
+    s_mul_i32           s[_s_tmp],           s[_s_wgid_y],   TILE_M
+    s_mul_i32           s[_s_tmp],           s[_s_tmp],      s[_s_A_strd]
+    s_add_co_u32        s[_s_glb_addr],      s[_s_tmp],      s[_s_A_buf]
+    s_add_co_ci_u32     s[_s_glb_addr + 1],  0,              s[_s_A_buf + 1]
+
+    s_mov_b32       s[_s_glb_addr_inc],      TILE_A_DIM0
+    s_mov_b32       s[_s_glb_addr_inc + 1],  0
+
+    s_mov_b32           s[_s_tensor_dim0],  s[_s_A_strd]
+    s_mul_i32           s[_s_tensor_dim1],  s[_s_wgid_y],       TILE_M
+    s_sub_co_u32        s[_s_tensor_dim1],  s[_s_M],            s[_s_tensor_dim1]
+    s_min_i32           s[_s_tensor_dim1],  s[_s_tensor_dim1],  TILE_M
+    s_mov_b32           s[_s_tensor_strd],  s[_s_A_strd]
+
+    if ENABLE_CLUSTER
+
+        s_bfe_u32       s[_s_workgroup_mask],  ttmp6,                 0x40004
+        s_mul_i32       s[_s_workgroup_mask],  s[_s_workgroup_mask],  4
+        s_lshl_b32      s[_s_workgroup_mask],  0xF,                   s[_s_workgroup_mask]
+    end
+
+    TDM_init_G0()
+    var first_sgpr = TDM_G1_first_sgpr(0x0000, 1, 1, 1, LDS_A_PAD_INTERVAL, LDS_A_PAD_AMOUNT)
+    TDM_init_G1(first_sgpr, TILE_A_DIM0, TILE_A_DIM1)
+end
+
+function TDM_init_B
+    s_mul_i32           s[_s_tmp],           s[_s_wgid_x],   TILE_N
+    s_mul_i32           s[_s_tmp],           s[_s_tmp],      s[_s_B_strd]
+    s_add_co_u32        s[_s_glb_addr],      s[_s_tmp],      s[_s_B_buf]
+    s_add_co_ci_u32     s[_s_glb_addr + 1],  0,              s[_s_B_buf + 1]
+
+    s_mov_b32       s[_s_glb_addr_inc],      TILE_B_DIM0
+    s_mov_b32       s[_s_glb_addr_inc + 1],  0
+
+    s_lshl_b32          s[_s_tensor_dim0],  s[_s_B_strd],       4
+    s_mul_i32           s[_s_tensor_dim1],  s[_s_wgid_x],       TILE_N
+    s_sub_co_u32        s[_s_tensor_dim1],  s[_s_N],            s[_s_tensor_dim1]
+    s_min_i32           s[_s_tensor_dim1],  s[_s_tensor_dim1],  TILE_N
+    s_lshr_b32          s[_s_tensor_dim1],  s[_s_tensor_dim1],  4
+
+    s_mov_b32       s[_s_tensor_strd],  s[_s_tensor_dim0]
+
+    if ENABLE_CLUSTER
+
+        s_bfe_u32       s[_s_workgroup_mask],  ttmp6,                 0x40000
+        s_lshl_b32      s[_s_workgroup_mask],  1,                     s[_s_workgroup_mask]
+        s_mul_i32       s[_s_workgroup_mask],  s[_s_workgroup_mask],  0x1111
+    end
+
+    TDM_init_G0()
+    var first_sgpr = TDM_G1_first_sgpr(0x0000, 1, 1, 0, 0, 0)
+    TDM_init_G1(first_sgpr, TILE_B_DIM0, TILE_B_DIM1)
+end
+
+function TDM_init_AS
+    s_mul_i32           s[_s_tmp],           s[_s_wgid_y],   TILE_M
+    s_mul_i32           s[_s_tmp],           s[_s_tmp],      s[_s_AS_strd]
+    s_add_co_u32        s[_s_glb_addr],      s[_s_tmp],      s[_s_AS_buf]
+    s_add_co_ci_u32     s[_s_glb_addr + 1],  0,              s[_s_AS_buf + 1]
+
+    s_mov_b32       s[_s_glb_addr_inc],      TILE_AS_DIM0
+    s_mov_b32       s[_s_glb_addr_inc + 1],  0
+
+    s_lshl_b32          s[_s_tensor_dim0],  s[_s_AS_strd],      5
+    s_mul_i32           s[_s_tensor_dim1],  s[_s_wgid_y],       TILE_M
+    s_sub_co_u32        s[_s_tensor_dim1],  s[_s_M],            s[_s_tensor_dim1]
+    s_min_i32           s[_s_tensor_dim1],  s[_s_tensor_dim1],  TILE_M
+    s_lshr_b32          s[_s_tensor_dim1],  s[_s_tensor_dim1],  5
+    s_mov_b32           s[_s_tensor_strd],  s[_s_tensor_dim0]
+
+    if ENABLE_CLUSTER
+
+        s_bfe_u32       s[_s_workgroup_mask],  ttmp6,                 0x40004
+        s_mul_i32       s[_s_workgroup_mask],  s[_s_workgroup_mask],  4
+        s_lshl_b32      s[_s_workgroup_mask],  0xF,                   s[_s_workgroup_mask]
+    end
+
+    TDM_init_G0()
+    var first_sgpr = TDM_G1_first_sgpr(0x0000, 1, 1, 0, 0, 0)
+    TDM_init_G1(first_sgpr, TILE_AS_DIM0, TILE_AS_DIM1)
+end
+
+function TDM_init_BS
+    s_mul_i32           s[_s_tmp],           s[_s_wgid_x],   TILE_N
+    s_mul_i32           s[_s_tmp],           s[_s_tmp],      s[_s_BS_strd]
+    s_add_co_u32        s[_s_glb_addr],      s[_s_tmp],      s[_s_BS_buf]
+    s_add_co_ci_u32     s[_s_glb_addr + 1],  0,              s[_s_BS_buf + 1]
+
+    s_mov_b32       s[_s_glb_addr_inc],      TILE_BS_DIM0
+    s_mov_b32       s[_s_glb_addr_inc + 1],  0
+
+    s_lshl_b32          s[_s_tensor_dim0],  s[_s_BS_strd],      5
+    s_mul_i32           s[_s_tensor_dim1],  s[_s_wgid_x],       TILE_N
+    s_sub_co_u32        s[_s_tensor_dim1],  s[_s_N],            s[_s_tensor_dim1]
+    s_min_i32           s[_s_tensor_dim1],  s[_s_tensor_dim1],  TILE_N
+    s_lshr_b32          s[_s_tensor_dim1],  s[_s_tensor_dim1],  5
+    s_mov_b32           s[_s_tensor_strd],  s[_s_tensor_dim0]
+
+    if ENABLE_CLUSTER
+
+        s_bfe_u32       s[_s_workgroup_mask],  ttmp6,                 0x40000
+        s_lshl_b32      s[_s_workgroup_mask],  1,                     s[_s_workgroup_mask]
+        s_mul_i32       s[_s_workgroup_mask],  s[_s_workgroup_mask],  0x1111
+    end
+    TDM_init_G0()
+    var first_sgpr = TDM_G1_first_sgpr(0x0000, 1, 1, 0, 0, 0)
+    TDM_init_G1(first_sgpr, TILE_BS_DIM0, TILE_BS_DIM1)
+end
+
+function TDM_init_input(wvid)
+    if wvid == 0
+        TDM_init_A()
+    elsif wvid == 1
+        TDM_init_B()
+    elsif wvid == 2
+        TDM_init_AS()
+    elsif wvid == 3
+        TDM_init_BS()
+    else
+        assert(0)
+    end
+end
+
+function prefetch_page_table(wvid)
+    set_vgpr_msb(wvid, 0, 0, 0, 0)
+
+    s_mul_i32           s[_s_tmp],      s[_s_tensor_dim1],  s[_s_tensor_strd]
+    v_mul_u32_u24       v[_v_tmp],      v0,                 64 * 1024
+    v_mov_b32           v[_v_tmp + 1],  0
+
+    v_cmp_lt_u32        vcc,          v[_v_tmp],    s[_s_tmp]
+    v_cndmask_b32       v[_v_tmp],    0,            v[_v_tmp],    vcc
+
+    if AM == 0
+        global_prefetch_b8   v[_v_tmp],  s[_s_glb_addr]  scope:SCOPE_CU
+    else
+        global_prefetch_b8   v[_v_tmp],  s[_s_glb_addr]  scope:SCOPE_SE
+    end
+end
+
+function TDM_init_output
+    s_mul_i32           s[_s_tmp],          s[_s_wgid_y],   TILE_M
+    s_and_b32           s[_s_tmp + 1],      s[_s_wvid],     0x1
+    s_mul_i32           s[_s_tmp + 1],      s[_s_tmp + 1],  BLOCK_M
+    s_add_co_u32        s[_s_tmp],          s[_s_tmp],      s[_s_tmp + 1]
+    s_min_i32           s[_s_tmp],          s[_s_tmp],      s[_s_M]
+    s_sub_co_u32        s[_s_tensor_dim1],  s[_s_M],        s[_s_tmp]
+
+    s_min_i32       s[_s_tensor_dim1],  s[_s_tensor_dim1],  TILE_M
+
+    s_mov_b32       s[_s_tensor_strd],  s[_s_D_strd]
+
+    s_mul_hi_u32        s[_s_tmp + 1],       s[_s_tmp],        s[_s_D_strd]
+    s_add_co_u32        s[_s_glb_addr + 1],  s[_s_D_buf + 1],  s[_s_tmp + 1]
+    s_mul_i32           s[_s_tmp + 1],       s[_s_tmp],        s[_s_D_strd]
+    s_add_co_u32        s[_s_glb_addr],      s[_s_D_buf],      s[_s_tmp + 1]
+    s_add_co_ci_u32     s[_s_glb_addr + 1],  0,                s[_s_glb_addr + 1]
+
+    s_mul_i32           s[_s_tmp],          s[_s_wgid_x],       TILE_N
+    s_lshr_b32          s[_s_tmp + 1],      s[_s_wvid],         1
+    s_mul_i32           s[_s_tmp + 1],      s[_s_tmp + 1],      BLOCK_N
+    s_add_co_u32        s[_s_tmp],          s[_s_tmp],          s[_s_tmp + 1]
+    s_min_i32           s[_s_tmp],          s[_s_tmp],          s[_s_N]
+    s_sub_co_u32        s[_s_tensor_dim0],  s[_s_N],            s[_s_tmp]
+    s_min_i32           s[_s_tensor_dim0],  s[_s_tensor_dim0],  BLOCK_N
+    s_lshl_b32          s[_s_tensor_dim0],  s[_s_tensor_dim0],  1
+
+    s_lshl_b32          s[_s_tmp],           s[_s_tmp],       1
+    s_add_co_u32        s[_s_glb_addr],      s[_s_glb_addr],  s[_s_tmp]
+    s_add_co_ci_u32     s[_s_glb_addr + 1],  0,               s[_s_glb_addr + 1]
+
+    TDM_init_G0()
+    s_mul_i32       s[_s_G0 + 1],  s[_s_wvid],  64 * 1024
+    var first_sgpr = TDM_G1_first_sgpr(0x0000, 1, 0, 0, 0, 0)
+    TDM_init_G1(first_sgpr, TILE_D_DIM0, TILE_D_DIM1)
+end
+
+function generate_A_lds_addr
+
+    v_and_b32           v[_v_tmp],       v0,           0xf
+    v_mul_u32_u24       v[_v_A_lds_rd],  v[_v_tmp],    TILE_K + LDS_A_PAD_AMOUNT
+    v_lshrrev_b32       v[_v_tmp],       4,            v0
+    v_mul_u32_u24       v[_v_tmp],       v[_v_tmp],    16
+    v_add_nc_u32        v[_v_A_lds_rd],  v[_v_tmp],    v[_v_A_lds_rd]
+
+    s_and_b32           s[_s_tmp],    s[_s_wvid],    0x1
+    s_mul_i32           s[_s_tmp],    s[_s_tmp],     LDS_A_TILE_SIZE / 2
+    v_add_nc_u32        v[_v_tmp],    s[_s_tmp],     v[_v_A_lds_rd]
+
+    for var i = 0; i < PF_TILES; i++
+        var offset = LDS_A_BASE + LDS_A_TILE_SIZE * i
+        v_add_nc_u32        v[_v_A_lds_rd + i],  offset,  v[_v_tmp]
+    end
+end
+
+function generate_B_lds_addr
+
+    v_lshlrev_b32       v[_v_B_lds_rd],  4,  v0
+
+    s_lshr_b32          s[_s_tmp],    s[_s_wvid],    0x1
+    s_mul_i32           s[_s_tmp],    s[_s_tmp],     LDS_B_TILE_SIZE / 2
+    v_add_nc_u32        v[_v_tmp],    s[_s_tmp],     v[_v_B_lds_rd]
+
+    for var i = 0; i < PF_TILES; i++
+        var offset = LDS_B_BASE + LDS_B_TILE_SIZE * i
+        v_add_nc_u32        v[_v_B_lds_rd + i],  offset,  v[_v_tmp]
+    end
+end
+
+function generate_AS_lds_addr
+
+    v_lshlrev_b32       v[_v_AS_lds_rd],  2,  v0
+
+    s_and_b32           s[_s_tmp],        s[_s_wvid],    0x1
+    s_mul_i32           s[_s_tmp],        s[_s_tmp],     LDS_AS_TILE_SIZE / 2
+    v_add_nc_u32        v[_v_AS_lds_rd],  s[_s_tmp],     v[_v_AS_lds_rd]
+
+    v_add_nc_u32        v[_v_AS_lds_rd],  LDS_AS_BASE,  v[_v_AS_lds_rd]
+end
+
+function generate_BS_lds_addr
+
+    v_lshlrev_b32       v[_v_BS_lds_rd],  2,  v0
+
+    s_lshr_b32          s[_s_tmp],        s[_s_wvid],    0x1
+    s_mul_i32           s[_s_tmp],        s[_s_tmp],     LDS_BS_TILE_SIZE / 2
+    v_add_nc_u32        v[_v_BS_lds_rd],  s[_s_tmp],     v[_v_BS_lds_rd]
+
+    v_add_nc_u32        v[_v_BS_lds_rd],  LDS_BS_BASE,  v[_v_BS_lds_rd]
+end
+
+function generate_D_lds_addr
+
+    v_and_b32           v[_v_tmp],       v0,           0xf
+    v_mul_u32_u24       v[_v_D_lds_wr],  v[_v_tmp],    BLOCK_N * 2 + LDS_D_PAD_AMOUNT
+
+    v_lshrrev_b32       v[_v_tmp],       4,            v0
+    v_lshlrev_b32       v[_v_tmp],       4,            v[_v_tmp]
+    v_add_nc_u32        v[_v_D_lds_wr],  v[_v_tmp],    v[_v_D_lds_wr]
+
+    s_mul_i32           s[_s_tmp],       64 * 1024,    s[_s_wvid]
+    v_add_nc_u32        v[_v_D_lds_wr],  s[_s_tmp],    v[_v_D_lds_wr]
+end
+
+function broadcast_lds_addr
+    for var msb = 1; msb < 4; msb++
+        set_vgpr_msb(0, msb, 0, 0, 0)
+
+        for var i = 0; i < PF_TILES; i++
+            v_mov_b32   v[_v_A_lds_rd + i],  v[_v_A_lds_rd + i]
+            v_mov_b32   v[_v_B_lds_rd + i],  v[_v_B_lds_rd + i]
+        end
+        v_mov_b32       v[_v_AS_lds_rd],  v[_v_AS_lds_rd]
+        v_mov_b32       v[_v_BS_lds_rd],  v[_v_BS_lds_rd]
+
+        var col_offset = (msb & 1) * SUB_N * 2
+        var row_offset = (msb / 2) * SUB_M * (BLOCK_N * 2 + LDS_D_PAD_AMOUNT)
+        v_add_nc_u32        v[_v_D_lds_wr],  row_offset + col_offset,  v[_v_D_lds_wr]
+    end
+    set_vgpr_msb(0, 0, 0, 0, 0)
+end
+
+var INST_LDS_LOAD_A     = 16
+var INST_LDS_LOAD_B     = 16
+var INST_LDS_LOAD_AS    = 2
+var INST_LDS_LOAD_BS    = 2
+var INST_LDS_LOAD_A_AS  = INST_LDS_LOAD_A + INST_LDS_LOAD_AS
+var INST_LDS_LOAD_B_BS  = INST_LDS_LOAD_B + INST_LDS_LOAD_BS
+
+function lds_load_A(wvid, tile, sub_A, inst_start, inst_num)
+    var msb_A = sub_AB_to_msb(wvid, sub_A)
+    set_vgpr_msb(wvid, msb_A, NA, NA, NA)
+
+    var stride = SUB_K + LDS_A_PAD_AMOUNT
+    var inst_end = (inst_start + inst_num < INST_LDS_LOAD_A) ? inst_start + inst_num : INST_LDS_LOAD_A
+
+    for var inst_idx = inst_start; inst_idx < inst_end; inst_idx++
+        var v_offset = inst_idx * 4
+        var lds_offset = sub_A * SUB_M * stride + (inst_idx / 4) * 16 * stride + (inst_idx % 4) * 32
+        ds_load_b128        v[_v_A + v_offset],  v[_v_A_lds_rd + tile]  offset:lds_offset
+    end
+    return inst_end
+end
+
+function lds_load_B(wvid, tile, sub_B, inst_start, inst_num)
+    var msb_B = sub_AB_to_msb(wvid, sub_B)
+    set_vgpr_msb(wvid, msb_B, NA, NA, NA)
+
+    var stride = SUB_K
+    var inst_end = (inst_start + inst_num < INST_LDS_LOAD_B) ? inst_start + inst_num : INST_LDS_LOAD_B
+
+    for var inst_idx = inst_start; inst_idx < inst_end; inst_idx++
+        var v_offset = inst_idx * 4
+        var lds_offset = (sub_B & 1) * SUB_M * stride + (inst_idx / 4) * 16 * stride + (inst_idx % 4) * (16 * 32)
+        ds_load_b128        v[_v_B + v_offset],  v[_v_B_lds_rd + tile]  offset:lds_offset
+    end
+    return inst_end
+end
+
+function lds_load_AS(wvid, tile, sub_A, inst_start, inst_num)
+    set_vgpr_msb(wvid, 0, NA, NA, NA)
+
+    var inst_end = (inst_start + inst_num < INST_LDS_LOAD_AS) ? inst_start + inst_num : INST_LDS_LOAD_AS
+
+    for var inst_idx = inst_start; inst_idx < inst_end; inst_idx++
+        var v_offset = sub_A * V_AS_SIZE + inst_idx
+        var lds_offset = inst_idx * 128 + sub_A * V_AS_SIZE * 128 + tile * LDS_AS_TILE_SIZE
+        ds_load_b32     v[_v_AS + v_offset],  v[_v_AS_lds_rd]  offset:lds_offset
+    end
+    return inst_end
+end
+
+function lds_load_BS(wvid, tile, sub_B, inst_start, inst_num)
+    set_vgpr_msb(wvid, 0, NA, NA, NA)
+
+    var inst_end = (inst_start + inst_num < INST_LDS_LOAD_BS) ? inst_start + inst_num : INST_LDS_LOAD_BS
+
+    for var inst_idx = inst_start; inst_idx < inst_end; inst_idx++
+        var v_offset = (sub_B & 1) * V_BS_SIZE + inst_idx
+        var lds_offset = inst_idx * 128 + (sub_B & 1) * V_BS_SIZE * 128 + tile * LDS_BS_TILE_SIZE
+        ds_load_b32     v[_v_BS + v_offset],  v[_v_BS_lds_rd]  offset:lds_offset
+    end
+    return inst_end
+end
+
+function fused_lds_load(wvid, tile, sub_AB, inst_start, inst_num)
+    var inst_end = inst_start
+    if sub_AB < 2
+        if inst_start < INST_LDS_LOAD_AS
+            inst_end = lds_load_AS(wvid, tile, sub_AB, inst_start, inst_num)
+        elsif inst_start < INST_LDS_LOAD_A_AS
+            inst_end = lds_load_A(wvid, tile, sub_AB, inst_start - INST_LDS_LOAD_AS, inst_num)
+            inst_end += INST_LDS_LOAD_AS
+        end
+    else
+        if inst_start < INST_LDS_LOAD_BS
+            inst_end = lds_load_BS(wvid, tile, sub_AB, inst_start, inst_num)
+        elsif inst_start < INST_LDS_LOAD_B_BS
+            inst_end = lds_load_B(wvid, tile, sub_AB, inst_start - INST_LDS_LOAD_BS, inst_num)
+            inst_end += INST_LDS_LOAD_BS
+        end
+    end
+    return inst_end
+end
+
+function init_ACC_D(wvid)
+    for var msb = 0; msb < 4; msb++
+        set_vgpr_msb(wvid, msb, NA, NA, NA)
+        for var i = 0; i < V_D_SIZE; i++
+            v_mov_b32   v[_v_D + i],  0
+        end
+    end
+end
+
+function cvt_and_ds_store
+    for var msb = 0; msb < 4; msb++
+        s_set_vgpr_msb      0x0 | msb << 6 | msb << 4 | msb << 2 | msb
+
+        for var m = 0; m < ACC_M; m++
+            for var n = 0; n < ACC_N; n++
+                var src_idx = (m * ACC_N + n) * 8
+                var dst_idx = (m * ACC_N + n) * 4
+
+                for var i = 0; i < 8; i += 2
+                    v_cvt_pk_bf16_f32   v[_v_D + dst_idx + i / 2],  v[_v_D + src_idx + i],  v[_v_D + src_idx + i + 1]
+                end
+            end
+        end
+
+        for var m = 0; m < ACC_M; m++
+            for var n = 0; n < ACC_N; n++
+
+                var lds_offset = n * 16 * 2 + m * 16 * TILE_D_DIM0
+                var dst_idx = (m * ACC_N + n) * 4
+                ds_store_b128   v[_v_D_lds_wr],  v[_v_D + dst_idx]  offset:lds_offset
+            end
+        end
+    end
+end
+
+function output_results
+    s_wait_idle
+    s_barrier_signal   -1
+
+    TDM_init_output()
+    s_barrier_wait      -1
+
+    if PREFETCH_PTL
+        s_cmp_eq_u32        s[_s_wvid],                     0
+        s_cbranch_scc0      label_skip_output_ptl_prefetch
+        prefetch_page_table(0)
+ label_skip_output_ptl_prefetch:
+    end
+
+    cvt_and_ds_store()
+    s_wait_dscnt        0
+
+    TDM_store()
+end
+
+function fused_wmma(order, wvid, tile, sub_D)
+    var is_wave02 = (wvid & 1) == 0
+    var tdm_sync_en = order == 1
+    var tdm_load_en = order == 2
+    var tdm_set_lds = tdm_load_en
+    var tdm_inc_en = order == 3
+    var tdm_inc_cnt = 0
+
+    var sub_A = sub_D >> 1
+    var sub_B = (sub_D & 1) + 2
+    var msb_D = sub_D
+    var msb_A = sub_AB_to_msb(wvid, sub_A)
+    var msb_B = sub_AB_to_msb(wvid, sub_B)
+
+    var dscnt = 8
+    dscnt = order == 2 ? 0 : (order == 3 ? NA : dscnt)
+
+    var lds_tile = (order < 2) ? tile : (tile + 1) % PF_TILES
+    var lds_sub_AB = msb_to_sub_AB(wvid, msb_D)
+    var lds_ld_max = lds_sub_AB < 2 ? INST_LDS_LOAD_A_AS : INST_LDS_LOAD_B_BS
+
+    var num_wmma = ACC_M * ACC_N
+    var lds_ld_cnt = 0
+    var idx = 0
+
+    for var mn = 0; mn < ACC_M * ACC_N; mn++
+        var m = is_wave02 ? mn % ACC_M : mn / ACC_N
+        var n = is_wave02 ? mn / ACC_M : mn % ACC_N
+
+        if idx == 0 && dscnt != NA
+            s_wait_dscnt   dscnt
+        elsif idx == num_wmma / 2 && dscnt != NA && dscnt != 0
+            s_wait_dscnt   lds_ld_cnt
+        end
+
+        var D = _v_D + (m * ACC_N + n) * 8
+        var A = _v_A + m * 16
+        var B = _v_B + n * 16
+        var AS = _v_AS + sub_A * V_AS_SIZE + m / 2
+        var BS = _v_BS + (sub_B & 1) * V_BS_SIZE + n / 2
+        var scale_a_opsel = m & 1
+        var scale_b_opsel = n & 1
+
+        set_vgpr_msb(wvid, msb_D, msb_B, msb_A, msb_D)
+        v_wmma_scale_f32_16x16x128_f8f6f4   v[D],  v[B],  v[A],  v[D],  v[BS],  v[AS]  matrix_a_scale:scale_b_opsel  matrix_b_scale:scale_a_opsel
+
+        if lds_ld_cnt < lds_ld_max
+            lds_ld_cnt = fused_lds_load(wvid, lds_tile, lds_sub_AB, lds_ld_cnt, 4)
+        elsif tdm_set_lds
+            TDM_set_G0_lds_addr(wvid, tile)
+            tdm_set_lds = 0
+        elsif tdm_load_en
+            TDM_load()
+            tdm_load_en = 0
+        elsif tdm_inc_en && tdm_inc_cnt < ITST_TDM_UPDATE_GLB_ADDR
+            tdm_inc_cnt = fused_TDM_update_G0_glb_addr(PF_TILES, tdm_inc_cnt, 3)
+            if tdm_inc_cnt == ITST_TDM_UPDATE_GLB_ADDR
+                tdm_inc_en = 0
+            end
+        end
+
+        if tdm_sync_en
+            if idx == num_wmma - 4
+                s_wait_tensorcnt   PF_TILES - 2
+                s_barrier_signal   -1
+            elsif idx == num_wmma - 1
+                s_barrier_wait   -1
+            end
+        end
+
+        idx++
+    end
+
+end
+
+function wave_main(wvid)
+    TDM_init_input(wvid)
+
+    if PREFETCH_PTL
+        prefetch_page_table(wvid)
+    end
+
+    for var i = 0; i < PF_TILES - 1; i++
+        TDM_set_G0_lds_addr(wvid, i)
+        TDM_load()
+        fused_TDM_update_G0_glb_addr(i, 0, ITST_TDM_UPDATE_GLB_ADDR)
+        wgp_barrier()
+    end
+
+    init_ACC_D(wvid)
+
+    s_wait_tensorcnt   PF_TILES - 2
+    wgp_barrier()
+
+    fused_lds_load(wvid, 0, A0, 0, INST_LDS_LOAD_AS)
+    fused_lds_load(wvid, 0, B0, 0, INST_LDS_LOAD_BS)
+    if (wvid & 1) == 0
+        fused_lds_load(wvid, 0, A0, INST_LDS_LOAD_AS, INST_LDS_LOAD_A)
+        fused_lds_load(wvid, 0, B0, INST_LDS_LOAD_BS, INST_LDS_LOAD_B)
+    else
+        fused_lds_load(wvid, 0, B0, INST_LDS_LOAD_BS, INST_LDS_LOAD_B)
+        fused_lds_load(wvid, 0, A0, INST_LDS_LOAD_AS, INST_LDS_LOAD_A)
+    end
+
+    TDM_set_G0_lds_addr(wvid, PF_TILES - 1)
+    TDM_load()
+    fused_TDM_update_G0_glb_addr(PF_TILES - 1, 0, ITST_TDM_UPDATE_GLB_ADDR)
+
+ label_core_loop_wave[wvid]:
+    for var tile = 0; tile < PF_TILES; tile++
+        if (wvid & 1) == 0
+            fused_wmma(0, wvid, tile, A0B0)
+            fused_wmma(1, wvid, tile, A0B1)
+            fused_wmma(2, wvid, tile, A1B0)
+            fused_wmma(3, wvid, tile, A1B1)
+        else
+            fused_wmma(0, wvid, tile, A0B0)
+            fused_wmma(1, wvid, tile, A1B0)
+            fused_wmma(2, wvid, tile, A0B1)
+            fused_wmma(3, wvid, tile, A1B1)
+        end
+
+        s_addk_i32          s[_s_loop_cur],       TILE_K
+        s_cmp_lt_i32        s[_s_loop_cur],       s[_s_loop_end]
+        s_cbranch_scc0      label_output_results
+    end
+
+    if ENABLE_CLUSTER
+
+        cluster_barrier()
+    end
+    s_branch        label_core_loop_wave[wvid]
+end
+
+shader main
+    type(CS)
+    wave_size(32)
+    sgpr_count(128)
+    user_sgpr_count(2)
+    tgid_x_en(1)
+    tgid_y_en(1)
+    tgid_z_en(1)
+    tidig_comp_cnt(2)
+
+    set_sched_mode(2)
+
+    s_and_b32       s1,  s1,  0xffff
+
+    s_load_dwordx2      s[_s_D_buf],    s[0:1],    0x0
+    s_load_dwordx2      s[_s_A_buf],    s[0:1],    0x10
+    s_load_dwordx2      s[_s_B_buf],    s[0:1],    0x20
+    s_load_dwordx2      s[_s_AS_buf],   s[0:1],    0x30
+    s_load_dwordx2      s[_s_BS_buf],   s[0:1],    0x40
+
+    s_load_dword        s[_s_D_strd],   s[0:1],    0x50
+    s_load_dword        s[_s_A_strd],   s[0:1],    0x60
+    s_load_dword        s[_s_B_strd],   s[0:1],    0x70
+    s_load_dword        s[_s_AS_strd],  s[0:1],    0x80
+    s_load_dword        s[_s_BS_strd],  s[0:1],    0x90
+    s_load_dword        s[_s_M],        s[0:1],    0xA0
+    s_load_dword        s[_s_N],        s[0:1],    0xB0
+    s_load_dword        s[_s_K],        s[0:1],    0xC0
+
+    v_and_b32       v0,            0x1f,     v0
+    s_bfe_u32       s[_s_wvid],    ttmp8,    0x50019
+
+    if ENABLE_CLUSTER
+
+        s_mov_b32           s[_s_tmp],      ttmp9
+        s_mul_i32           s[_s_tmp],      s[_s_tmp],      CLUSTER_N
+        s_bfe_u32           s[_s_wgid_x],   ttmp6,          0x40000
+        s_add_co_u32        s[_s_wgid_x],   s[_s_wgid_x],   s[_s_tmp]
+
+        s_and_b32           s[_s_tmp],      ttmp7,          0xffff
+        s_mul_i32           s[_s_tmp],      s[_s_tmp],      CLUSTER_M
+        s_bfe_u32           s[_s_wgid_y],   ttmp6,          0x40004
+        s_add_co_u32        s[_s_wgid_y],   s[_s_wgid_y],   s[_s_tmp]
+    else
+        s_mov_b32       s[_s_wgid_x],   ttmp9
+        s_and_b32       s[_s_wgid_y],   ttmp7,    0xffff
+    end
+
+    var inst_pref_start
+    var PREFETCH_SIZE = 42308
+
+    if PREFETCH_INST
+        s_cmp_eq_u32        s[_s_wvid],          0
+        s_cbranch_scc0      label_skip_prefetch
+
+        inst_pref_start = get_dword_offset()
+        print "inst_pref_start: ", inst_pref_start, "DW"
+
+        s_getreg_b32        s[_s_tmp],  { id:HW_REG_WAVE_MODE }
+        set_inst_prefetch(1)
+        s_getreg_b32        s[_s_tmp],  { id:HW_REG_WAVE_MODE }
+
+        s_get_pc_i64        s[_s_tmp]
+        s_mov_b32           s[_s_tmp + 2],  31
+
+        var prefetch_times = (PREFETCH_SIZE + 4096 - 1) / 4096;
+        for var i = 0; i < prefetch_times + 1; i++
+            s_prefetch_inst   s[_s_tmp],  i * 4096,  s[_s_tmp + 2],  0
+        end
+
+ label_skip_prefetch:
+    end
+
+    s_wait_kmcnt        0
+
+
+    s_mul_i32           s[_s_tmp],          s[_s_wgid_y],   TILE_M
+    s_cmp_lt_u32        s[_s_tmp],          s[_s_M]
+    s_cbranch_scc0      label_program_exit
+
+    s_mul_i32           s[_s_tmp],          s[_s_wgid_x],   TILE_N
+    s_cmp_lt_u32        s[_s_tmp],          s[_s_N]
+    s_cbranch_scc0      label_program_exit
+
+    generate_A_lds_addr()
+    generate_B_lds_addr()
+    generate_AS_lds_addr()
+    generate_BS_lds_addr()
+    generate_D_lds_addr()
+    broadcast_lds_addr()
+
+    if ENABLE_CLUSTER
+        cluster_barrier()
+    end
+
+    s_mov_b32       s[_s_loop_cur],  0
+    s_mov_b32       s[_s_loop_end],  s[_s_K]
+
+    s_cmp_eq_u32        s[_s_wvid],    0
+    s_cbranch_scc1      label_wave0
+    s_cmp_eq_u32        s[_s_wvid],    1
+    s_cbranch_scc1      label_wave1
+    s_cmp_eq_u32        s[_s_wvid],    2
+    s_cbranch_scc1      label_wave2
+    s_cmp_eq_u32        s[_s_wvid],    3
+    s_cbranch_scc1      label_wave3
+
+ label_wave0:
+    wave_main(0)
+
+ label_wave1:
+    wave_main(1)
+
+ label_wave2:
+    wave_main(2)
+
+ label_wave3:
+    wave_main(3)
+
+ label_output_results:
+    output_results()
+
+ label_program_exit:
+    s_wait_idle
+    s_endpgm
+
+    if PREFETCH_INST == 1
+        var inst_pref_end = get_dword_offset()
+        var INST_SIZE = (inst_pref_end - inst_pref_start) * 4
+        print "inst_pref_end:", inst_pref_end, "DW, inst_size:", INST_SIZE, "Bytes"
+        if INST_SIZE != PREFETCH_SIZE
+            print "Please change PREFETCH_SIZE to ", INST_SIZE
+        end
+    end
+end

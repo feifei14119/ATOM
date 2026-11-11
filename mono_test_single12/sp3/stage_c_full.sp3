@@ -1,0 +1,279 @@
+/*******************************************************************************
+ *                      STAGE_C_FULL (mono step kernel, the whole stage_C, P2)
+ *
+ * attention.stage_C as one inline fragment: the wave guard, the tile coordinates, the wq_b MXFP8 GEMM (rewritten from
+ * sp3/ref/MXFP8_GEMM_1TG_4W_128mx2_128nx2.sp3), the q_norm rstd, the RoPE
+ * of the last 64 columns of each 512-column head and the bf16 store of the 16x16 q tile. Every wave of the CTA
+ * enters; the ones stage_C leaves idle branch to the end.
+ *
+ ******************************************************************************/
+
+/**
+ * Fixed inputs (read only; bound by the inline asm constraints). Pointers are the raw bases from the stage_C dict:
+ * every tile / row / lane offset is computed here, in VGPR offsets, so the fragment needs no SGPR temporaries.
+ *
+ *   reg        content
+ * ---------------------------------------------------------------------------------------
+ *   v0         lane 0..31
+ *   s[0:1]     qr8    fp8 e4m3 [T][1280]
+ *   s[2:3]     wqb    fp8 e4m3 [8192][1280]
+ *   s[4:5]     qrs    E8M0 [T][40]
+ *   s[6:7]     wqb_s  E8M0 [256][40]           one code a 32x32 block
+ *   s[8:9]     ss     f32 [T]                  q_norm sum of squares
+ *   s[10:11]   q      bf16 [T][8192]           output
+ *   s[12:13]   rpos   i64 [T]                  RoPE position of each row
+ *   s[14:15]   rcos   bf16 [pos][32]
+ *   s[16:17]   rsin   bf16 [pos][32]
+ *   s18        b      CTA index 0..255
+ *   s19        w      wave index 0..7
+ *   s20        wave mask: bit w set <=> stage_C gives wave w a tile (w < 6 and w % 3 < MT)
+ *
+ * Tile of wave w: j = w / 3, mi = w % 3, rows mi*16 .. +15, columns n0 = (b + j*256)*16 .. +15.
+ * No outputs. Clobbers: v1-v151, VCC, SCC, memory. No EXEC, M0, MODE or other SGPR write; full EXEC on entry.
+ * Hazards handled here (LLVM does not look inside inline asm): s_wait_xcnt 0 on entry; 4 v_nop between the last WMMA
+ * and the first VALU; a v_nop after each TRANS (v_rcp / v_rsq) before a VALU that reads its result or writes its source
+ * (gfx1250 TRANS coexecution); s_wait_xcnt 0 between the stores, and s_wait_xcnt 0 + s_wait_storecnt 0 on exit (the
+ * caller's waitcnt pass does not see this fragment's stores).
+ */
+
+var DEBUG       = 1
+
+var MMA_K       = 128
+var K_STEPS     = 10            // Q_RANK 1280 / 128
+var ROW_BYTES   = 1280          // qr8 / wqb row stride (QL)
+var SCALE_ROW   = 40            // qrs / wqb_s row stride (QL / 32)
+var NQ          = 8192          // q row (elements)
+var HD          = 512           // head dim; RoPE on its last 64 columns
+var CTAS        = 256
+var NORM_DIV    = 1280.0        // ss / QL
+var NORM_EPS    = 0x1e3ce508    // f32(1e-20)
+var PF_TILES    = 4
+var LD_PER_STEP = 10            // 4 x b128 B, 1 x b32 SB, 4 x b128 A, 1 x b32 SA
+var WMMA_VALU_WAIT = 4
+
+var _s_qr8      = 0
+var _s_wqb      = 2
+var _s_qrs      = 4
+var _s_wqbs     = 6
+var _s_ss       = 8
+var _s_q        = 10
+var _s_rpos     = 12
+var _s_rcos     = 14
+var _s_rsin     = 16
+var _s_b        = 18
+var _s_w        = 19
+var _s_mask     = 20
+
+// prologue / GEMM
+var _v_lane     = 0
+var _v_off_A    = 1             // mi*16*1280 + (l%16)*1280 + (l/16)*16
+var _v_off_AS   = 2             // mi*16*40 + (l%16)*40
+var _v_off_BS   = 3             // (n0/32)*40
+var _v_tmp      = 4
+var _v_off_B    = 5             // n0*1280 + (l%16)*1280 + (l/16)*16
+var _v_mi       = 6
+var _v_n0       = 7
+var _v_D        = 8             // acc[8]: row (l/16)*8 + i, column l%16
+var _v_A        = 16
+var _v_B        = _v_A + 16 * PF_TILES
+var _v_AS       = _v_B + 16 * PF_TILES
+var _v_BS       = _v_AS + PF_TILES
+var _v_end      = _v_BS + PF_TILES
+
+// epilogue (reuses the GEMM buffers)
+var _v_row4     = 16            // row0*4, row0 = mi*16 + (l/16)*8
+var _v_row8     = 17            // row0*8
+var _v_qoff     = 18            // (row0*8192 + n0 + l%16)*2
+var _v_fi2      = 20            // [20:21] = {fi*2, 0}
+var _v_div      = 22            // 22..27 division temporaries
+var _v_ss       = 32            // 8
+var _v_rs       = 40            // 8: rstd
+var _v_cv       = 48            // 8: cv, then the result
+var _v_rp       = 56            // 8 x 2: rpos
+var _v_ta       = 72            // [72:73] (rpos << 6) + fi*2
+var _v_ac       = 80            // 8 x 2: rcos addresses
+var _v_as       = 96            // 8 x 2: rsin addresses
+var _v_cs       = 112           // 8
+var _v_sn       = 120           // 8
+var _v_x        = 128           // 8: bf16(cv)
+var _v_y        = 136           // 8: bf16(neighbour cv)
+var _v_xc       = 144           // x*cs
+var _v_ys       = 145           // y*sn
+var _v_st       = 146           // bf16 to store
+
+assert(_v_end == 152)
+if DEBUG
+    print "VGPRs used: v0..v", _v_end - 1
+end
+
+function issue_step(k)
+    var slot = k % PF_TILES
+    var kb   = k * MMA_K
+    var A    = _v_A + slot * 16
+    var B    = _v_B + slot * 16
+    for var c = 0; c < 4; c++
+        global_load_b128    v[B + c * 4],  v[_v_off_B],  s[_s_wqb:_s_wqb+1]  offset:kb + c * 32
+    end
+    global_load_b32     v[_v_BS + slot],  v[_v_off_BS],  s[_s_wqbs:_s_wqbs+1]  offset:kb / 32
+    for var c = 0; c < 4; c++
+        global_load_b128    v[A + c * 4],  v[_v_off_A],  s[_s_qr8:_s_qr8+1]  offset:kb + c * 32
+    end
+    global_load_b32     v[_v_AS + slot],  v[_v_off_AS],  s[_s_qrs:_s_qrs+1]  offset:kb / 32
+end
+
+function wmma_step(k)
+    var slot = k % PF_TILES
+    var issued = (k + PF_TILES - 1 < K_STEPS - 1) ? k + PF_TILES - 1 : K_STEPS - 1
+    s_wait_loadcnt      (issued - k) * LD_PER_STEP
+    if k == 0
+        v_wmma_scale_f32_16x16x128_f8f6f4   v[_v_D],  v[_v_A + slot * 16],  v[_v_B + slot * 16],  0,  v[_v_AS + slot],  v[_v_BS + slot]
+    else
+        v_wmma_scale_f32_16x16x128_f8f6f4   v[_v_D],  v[_v_A + slot * 16],  v[_v_B + slot * 16],  v[_v_D],  v[_v_AS + slot],  v[_v_BS + slot]
+    end
+end
+
+// rstd[i] = rsq(ss[row0 + i] / 1280 + 1e-20) with the native IEEE division sequence; cv[i] = acc[i] * rstd[i]
+function norm_row(i)
+    var ss = _v_ss + i
+    var d  = _v_div
+    var n  = _v_div + 1
+    var r  = _v_div + 2
+    var e  = _v_div + 3
+    var q  = _v_div + 4
+    v_div_scale_f32     v[d],  null,    NORM_DIV,  NORM_DIV,  v[ss]
+    v_div_scale_f32     v[n],  vcc_lo,  v[ss],     NORM_DIV,  v[ss]
+    v_rcp_f32           v[r],  v[d]
+    v_nop
+    v_fma_f32           v[e],  -v[d],  v[r],  1.0
+    v_fmac_f32          v[r],  v[e],   v[r]
+    v_mul_f32           v[q],  v[n],   v[r]
+    v_fma_f32           v[e],  -v[d],  v[q],  v[n]
+    v_fmac_f32          v[q],  v[e],   v[r]
+    v_fma_f32           v[e],  -v[d],  v[q],  v[n]
+    v_div_fmas_f32      v[e],  v[e],   v[r],  v[q]
+    v_div_fixup_f32     v[e],  v[e],   NORM_DIV,  v[ss]
+    v_add_f32           v[e],  NORM_EPS,  v[e]
+    v_rsq_f32           v[_v_rs + i],  v[e]
+    v_nop
+    v_mul_f32           v[_v_cv + i],  v[_v_D + i],  v[_v_rs + i]
+end
+
+shader main
+    type(CS)
+    wave_size(32)
+    sgpr_count(21)
+
+    // LLVM inserts no s_wait_xcnt for an inline asm's clobbers: a VMEM issued just before may still read them
+    s_wait_xcnt         0
+
+    // ---- guard: stage_C's (w < 6) & (w % 3 < MT), folded into a mask by the caller
+    s_bitcmp1_b32       s[_s_mask],  s[_s_w]
+    s_cbranch_scc0      label_done
+
+    // ---- tile coordinates (wave-uniform, kept in VGPRs)
+    v_mul_u32_u24       v[_v_tmp],   11,  s[_s_w]                   // j = w / 3 = (11 w) >> 5 for w < 6
+    v_lshrrev_b32       v[_v_tmp],   5,   v[_v_tmp]
+    v_lshl_add_u32      v[_v_n0],    v[_v_tmp],  8,  s[_s_b]          // b + j*256
+    v_lshlrev_b32       v[_v_n0],    4,   v[_v_n0]                  // n0
+    v_mul_u32_u24       v[_v_tmp],   3,   v[_v_tmp]
+    v_sub_nc_u32        v[_v_mi],    s[_s_w],  v[_v_tmp]            // mi = w - 3 j
+
+    // ---- per-lane GEMM offsets
+    v_and_b32           v[_v_tmp],    15,  v[_v_lane]                // l % 16
+    v_lshrrev_b32       v[_v_off_B],  4,   v[_v_lane]
+    v_lshlrev_b32       v[_v_off_B],  4,   v[_v_off_B]                // (l/16)*16
+    v_mad_u32_u24       v[_v_off_B],  v[_v_tmp],  ROW_BYTES,  v[_v_off_B]
+    v_mad_u32_u24       v[_v_off_A],  v[_v_mi],   16 * ROW_BYTES,  v[_v_off_B]
+    v_mad_u32_u24       v[_v_off_B],  v[_v_n0],   ROW_BYTES,  v[_v_off_B]
+    v_mul_u32_u24       v[_v_off_AS], SCALE_ROW,  v[_v_tmp]
+    v_mad_u32_u24       v[_v_off_AS], v[_v_mi],   16 * SCALE_ROW,  v[_v_off_AS]
+    v_lshrrev_b32       v[_v_off_BS], 5,   v[_v_n0]
+    v_mul_u32_u24       v[_v_off_BS], SCALE_ROW,  v[_v_off_BS]
+
+    // ---- GEMM: acc = qr8 tile . wqb tile^T, K = 1280
+    for var k = 0; k < PF_TILES; k++
+        issue_step(k)
+    end
+    for var k = 0; k < K_STEPS; k++
+        wmma_step(k)
+        if k + PF_TILES < K_STEPS
+            issue_step(k + PF_TILES)
+        end
+    end
+    for var i = 0; i < WMMA_VALU_WAIT; i++
+        v_nop
+    end
+
+    // ---- epilogue offsets; ss loads
+    v_lshrrev_b32       v[_v_row4],  4,  v[_v_lane]
+    v_lshlrev_b32       v[_v_row4],  3,  v[_v_row4]                  // (l/16)*8
+    v_lshl_add_u32      v[_v_row4],  v[_v_mi],  4,  v[_v_row4]          // row0
+    v_and_b32           v[_v_tmp],   15, v[_v_lane]
+    v_lshl_add_u32      v[_v_qoff],  v[_v_row4],  13,  v[_v_n0]         // row0*8192 + n0
+    v_add_nc_u32        v[_v_qoff],  v[_v_qoff],  v[_v_tmp]
+    v_lshlrev_b32       v[_v_qoff],  1,  v[_v_qoff]
+    v_lshlrev_b32       v[_v_row8],  3,  v[_v_row4]
+    v_lshlrev_b32       v[_v_row4],  2,  v[_v_row4]
+    for var i = 0; i < 8; i++
+        global_load_b32     v[_v_ss + i],  v[_v_row4],  s[_s_ss:_s_ss+1]  offset:i * 4
+    end
+    s_wait_loadcnt      0
+
+    for var i = 0; i < 8; i++
+        norm_row(i)
+    end
+
+    // ---- RoPE tile? (n0 % 512 >= 448, wave-uniform)
+    v_and_b32           v[_v_tmp],  HD - 1,  v[_v_n0]
+    v_cmp_lt_u32        vcc_lo,  HD - 64 - 1,  v[_v_tmp]
+    s_cbranch_vccz      label_store
+
+    // fi*2 = (n0 % 512 - 448 + l % 16) & ~1
+    v_subrev_nc_u32     v[_v_tmp],  HD - 64,  v[_v_tmp]
+    v_and_b32           v[_v_fi2],  15,  v[_v_lane]
+    v_add_nc_u32        v[_v_fi2],  v[_v_fi2],  v[_v_tmp]
+    v_and_b32           v[_v_fi2],  -2,  v[_v_fi2]
+    v_mov_b32           v[_v_fi2 + 1],  0
+    for var i = 0; i < 8; i++
+        global_load_b64     v[_v_rp + 2 * i : _v_rp + 2 * i + 1],  v[_v_row8],  s[_s_rpos:_s_rpos+1]  offset:i * 8
+    end
+    s_wait_loadcnt      0
+    for var i = 0; i < 8; i++
+        v_lshlrev_b64       v[_v_ta:_v_ta+1],  6,  v[_v_rp + 2 * i : _v_rp + 2 * i + 1]
+        v_add_nc_u64        v[_v_ta:_v_ta+1],  v[_v_ta:_v_ta+1],  v[_v_fi2:_v_fi2+1]
+        v_add_nc_u64        v[_v_ac + 2 * i : _v_ac + 2 * i + 1],  s[_s_rcos:_s_rcos+1],  v[_v_ta:_v_ta+1]
+        v_add_nc_u64        v[_v_as + 2 * i : _v_as + 2 * i + 1],  s[_s_rsin:_s_rsin+1],  v[_v_ta:_v_ta+1]
+    end
+    for var i = 0; i < 8; i++
+        global_load_u16     v[_v_cs + i],  v[_v_ac + 2 * i : _v_ac + 2 * i + 1],  off
+        global_load_u16     v[_v_sn + i],  v[_v_as + 2 * i : _v_as + 2 * i + 1],  off
+    end
+    // x = bf16(cv), y = bf16(cv of lane ^ 1): attention.py's cv.to(BF16), two roundings (acc*rstd -> f32 -> bf16). The
+    // mono build emits exactly this; LLVM folds it to one v_fma_mixlo_bf16 rounding only in a kernel holding stage_C alone
+    for var i = 0; i < 8; i++
+        v_cvt_pk_bf16_f32   v[_v_x + i],  v[_v_cv + i],  0
+        v_cvt_pk_bf16_f32   v[_v_y + i],  v[_v_cv + i],  0  quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:1
+    end
+    v_and_b32           v[_v_tmp],  1,  v[_v_lane]
+    v_cmp_eq_u32        vcc_lo,  0,  v[_v_tmp]                       // even lane: x*cs - y*sn
+    s_wait_loadcnt      0
+    for var i = 0; i < 8; i++
+        v_fma_mix_f32_bf16  v[_v_xc],  v[_v_x + i].l,  v[_v_cs + i].l,  -0.0
+        v_fma_mix_f32_bf16  v[_v_ys],  v[_v_y + i].l,  v[_v_sn + i].l,  -0.0
+        v_cndmask_b32       v[_v_ys],  v[_v_ys],  -v[_v_ys],  vcc_lo
+        v_add_f32           v[_v_cv + i],  v[_v_xc],  v[_v_ys]
+    end
+
+label_store:
+    for var i = 0; i < 8; i++
+        v_cvt_pk_bf16_f32   v[_v_st + (i & 1)],  v[_v_cv + i],  0
+        if i > 0
+            s_wait_xcnt         0
+        end
+        global_store_b16    v[_v_qoff],  v[_v_st + (i & 1)],  s[_s_q:_s_q+1]  offset:i * NQ * 2  scope:SCOPE_DEV
+    end
+
+label_done:
+    s_wait_xcnt         0
+    s_wait_storecnt     0
+end

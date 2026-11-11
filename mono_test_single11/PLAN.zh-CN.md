@@ -58,6 +58,14 @@ stage_C 的输入（`qr8/qrs/ss`）由 stage_A 产生，`ss` 是 atomic 累加�
 
 ## 5. 详细步骤
 
+> **进度（2026-11-11）：** 步骤 0–4 已完成，P1 在单元 kernel 和 mono（4/40 层，48/6 行）中都与原生逐位一致，结果见 [README.md](README.md)。实现上和下文的差异：
+> - ASM 源码改用 SP3 编写（`sp3/stage_c_gemm.sp3`，由参考 `sp3/ref/` 改写），用 `/app/sp3cvt/sp3` 编译；
+> - 片段入口加了 `s_wait_xcnt 0`；
+> - 片段的 SHA-256 拼进 JIT 缓存 key；
+> - run-to-run 默认只报告不判定。
+>
+> 步骤 5（P2）未开始，所需的原生指令形式见 [notes/native_stage_c.md](notes/native_stage_c.md)。
+
 ### 步骤 0：准备（本次已完成）
 1. `mono_test_single` 改名为 `mono_test_single_origin`，并更新 README 里的路径。
 2. 新建本目录，写出本方案和 [ASM 伪代码](ASM_PSEUDO.zh-CN.md)。

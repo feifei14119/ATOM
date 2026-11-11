@@ -89,8 +89,11 @@ clobber 必须逐个列出（`~{v[16:151]}` 这种区间写法会被 LLVM 静默
 
 ### 3.2 伪代码
 
+正式实现见 `sp3/stage_c_gemm.sp3`。实现时有两处改动：入口加了 `s_wait_xcnt 0`（LLVM 不会为 inline asm 的 clobber/输出插入这个等待，紧挨在片段前的 store 可能还在读将被改写的 VGPR）；`WMMA_WAR_GUARD` 为空（原生 ISA 证实 VMEM 覆盖 WMMA 源寄存器无需等待），`WMMA_RAW_GUARD` = 4 个 `v_nop`。
+
 ```asm
 // ---------- 地址准备 ----------
+    s_wait_xcnt      0
     v_and_b32        v4, 15, v0                 // r
     v_lshrrev_b32    v1, 4, v0                  // h
     v_lshlrev_b32    v1, 4, v1                  // 16*h
@@ -281,6 +284,8 @@ P2 不写任何 SGPR（`s18` 只读），不用 `s30–s39`。
 - 分支标签在嵌入时改成数字局部标签（`1:`/`1f`），避免和 kernel 其他部分重名。
 
 ### 4.3 逐位一致的注意点
+
+> 原生 ISA 已经摘录到 [notes/native_stage_c.md](notes/native_stage_c.md)，和本节伪代码有出入时以它为准。最重要的一点：原生用 `v_fma_mixlo_bf16(acc, rstd)` 计算 x，只舍入一次；除法是完整的 IEEE 序列，需要 VCC 和 SGPR 临时寄存器。
 
 1. **`DIV_BY_1280`、`+eps`、`rsq`、`acc*rstd` 的运算顺序和指令必须照抄原生**（步骤 1）。LLVM 对 `fdiv f32` 的默认展开和是否允许倒数近似，取决于 FlyDSL 设置的 fast-math 标志，不能猜。
 2. **RoPE 用的是舍入后的 x/y，非 RoPE 列用的是未舍入的 cv**，和 `attention.py:325–328` 一致。y 先取邻居 lane 再舍入，和原生 `cv.shuffle_xor(1).to(BF16)` 等价（两种顺序得到的位模式相同）。

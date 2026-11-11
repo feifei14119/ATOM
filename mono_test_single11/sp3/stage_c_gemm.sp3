@@ -1,0 +1,117 @@
+/*******************************************************************************
+ *                      STAGE_C_GEMM (mono step kernel, stage_C, P1)
+ *
+ * Rewritten from MXFP8_GEMM_1TG_4W_128mx2_128nx2.sp3 (poc_kl_sim mi400 mxfp8fp4gemm):
+ * the same v_wmma_scale_f32_16x16x128_f8f6f4 MXFP8 x MXFP8 core, without the TDM -> LDS staging,
+ * the 256x256 tile and the kernarg / workgroup setup. This is an inline fragment, not a kernel:
+ * one wave computes one 16x16 fp32 tile of qr8 . wqb^T over K = 1280 (10 K128 steps).
+ *
+ ******************************************************************************/
+
+/**
+ * Fixed inputs (read only; bound by the inline asm constraints)
+ *
+ *   reg        content
+ * ---------------------------------------------------------------------------------------
+ *   v0         lane 0..31
+ *   s[0:1]     A  tile base  = qr8   + mi*16*1280       fp8 e4m3, row stride 1280 B
+ *   s[2:3]     B  tile base  = wqb   + n0*1280          fp8 e4m3, row stride 1280 B
+ *   s[4:5]     SA tile base  = qrs   + mi*16*40         E8M0, one code a row a K32, row stride 40 B
+ *   s[6:7]     SB tile base  = wqb_s + (n0/32)*40       E8M0, one code a 32x32 block (same for all 16 rows)
+ *
+ * Output: v[8:15] = D, lane l: rows (l/16)*8 + 0..7, column l%16 (the mono wmma_mx layout).
+ * Clobbers: v1-v4, v16-v151. No SGPR, VCC, SCC, EXEC, M0 or MODE write; full EXEC on entry.
+ * Hazards handled here (LLVM does not look inside inline asm): s_wait_xcnt 0 on entry; 4 v_nop after the last WMMA
+ * before the caller's VALU reads v[8:15].
+ */
+
+var DEBUG       = 1
+
+var MMA_K       = 128
+var K_STEPS     = 10            // Q_RANK 1280 / 128
+var ROW_BYTES   = 1280          // A / B row stride
+var SCALE_ROW   = 40            // scale row stride (1280 / 32)
+var PF_TILES    = 4             // load slots in flight (mono mx_loop D=4)
+var LD_PER_STEP = 10            // 4 x b128 B, 1 x b32 SB, 4 x b128 A, 1 x b32 SA
+var WMMA_VALU_WAIT = 4          // XDL WMMA (8-pass) -> VALU read of D / write of A/B/D: 4 wait states
+
+var _s_A_buf    = 0
+var _s_B_buf    = 2
+var _s_AS_buf   = 4
+var _s_BS_buf   = 6
+
+var _v_lane     = 0
+var _v_off_AB   = 1             // (l%16)*1280 + (l/16)*16
+var _v_off_AS   = 2             // (l%16)*40
+var _v_zero     = 3
+var _v_tmp      = 4
+var _v_D        = 8
+var _v_A        = 16            // 4 slots x 16
+var _v_B        = _v_A + 16 * PF_TILES
+var _v_AS       = _v_B + 16 * PF_TILES
+var _v_BS       = _v_AS + PF_TILES
+var _v_end      = _v_BS + PF_TILES
+
+assert(_v_end == 152)
+if DEBUG
+    print "VGPRs used: v0..v", _v_end - 1
+end
+
+function issue_step(k)
+    var slot = k % PF_TILES
+    var kb   = k * MMA_K
+    var A    = _v_A + slot * 16
+    var B    = _v_B + slot * 16
+    // the mono mx_loop order: fb (B, SB) before fa (A, SA)
+    for var c = 0; c < 4; c++
+        global_load_b128    v[B + c * 4],  v[_v_off_AB],  s[_s_B_buf:_s_B_buf+1]  offset:kb + c * 32
+    end
+    global_load_b32     v[_v_BS + slot],  v[_v_zero],  s[_s_BS_buf:_s_BS_buf+1]  offset:kb / 32
+    for var c = 0; c < 4; c++
+        global_load_b128    v[A + c * 4],  v[_v_off_AB],  s[_s_A_buf:_s_A_buf+1]  offset:kb + c * 32
+    end
+    global_load_b32     v[_v_AS + slot],  v[_v_off_AS],  s[_s_AS_buf:_s_AS_buf+1]  offset:kb / 32
+end
+
+function wmma_step(k)
+    var slot = k % PF_TILES
+    var issued = (k + PF_TILES - 1 < K_STEPS - 1) ? k + PF_TILES - 1 : K_STEPS - 1
+    s_wait_loadcnt      (issued - k) * LD_PER_STEP
+    if k == 0
+        v_wmma_scale_f32_16x16x128_f8f6f4   v[_v_D],  v[_v_A + slot * 16],  v[_v_B + slot * 16],  0,  v[_v_AS + slot],  v[_v_BS + slot]
+    else
+        v_wmma_scale_f32_16x16x128_f8f6f4   v[_v_D],  v[_v_A + slot * 16],  v[_v_B + slot * 16],  v[_v_D],  v[_v_AS + slot],  v[_v_BS + slot]
+    end
+end
+
+shader main
+    type(CS)
+    wave_size(32)
+    sgpr_count(8)
+
+    // LLVM inserts no s_wait_xcnt for an inline asm's clobbers / outputs: a VMEM issued just before the fragment may
+    // still be reading the VGPRs written below
+    s_wait_xcnt         0
+
+    v_and_b32           v[_v_tmp],     15,             v[_v_lane]
+    v_lshrrev_b32       v[_v_off_AB],  4,              v[_v_lane]
+    v_lshlrev_b32       v[_v_off_AB],  4,              v[_v_off_AB]
+    v_mad_u32_u24       v[_v_off_AB],  v[_v_tmp],      ROW_BYTES,      v[_v_off_AB]
+    v_mul_u32_u24       v[_v_off_AS],  SCALE_ROW,      v[_v_tmp]
+    v_mov_b32           v[_v_zero],    0
+
+    for var k = 0; k < PF_TILES; k++
+        issue_step(k)
+    end
+
+    for var k = 0; k < K_STEPS; k++
+        wmma_step(k)
+        if k + PF_TILES < K_STEPS
+            issue_step(k + PF_TILES)    // VMEM overwriting the slot this WMMA reads: no wait state needed
+        end
+    end
+
+    for var i = 0; i < WMMA_VALU_WAIT; i++
+        v_nop
+    end
+end

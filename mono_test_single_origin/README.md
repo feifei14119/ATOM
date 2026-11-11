@@ -5,7 +5,7 @@
 ## 运行
 
 ```bash
-cd /app/ATOM/mono_test_single
+cd /app/ATOM/mono_test_single_origin
 ./run.sh                                  # 48 行、4 层、3 次 launch
 ./run.sh --rows 6 --layers 1              # 最小配置
 ./run.sh --layers 40 --repeat 2           # 完整 40 层（只做健康检查，见下）

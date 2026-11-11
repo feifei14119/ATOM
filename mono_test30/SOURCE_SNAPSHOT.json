@@ -1,0 +1,196 @@
+{
+  "basis": "same C1 slice -> norm -> WQKV as mono_test00/01/10; isolated helpers from mono_test20",
+  "files": [
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/__init__.py",
+      "copy": "mono1250/__init__.py",
+      "sha256": "41ec658715296fbfb56e69293333bf08bef3b1bc87d2278ae8aa9047e9fe232f",
+      "local_sha256": "41ec658715296fbfb56e69293333bf08bef3b1bc87d2278ae8aa9047e9fe232f"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/device/__init__.py",
+      "copy": "mono1250/device/__init__.py",
+      "sha256": "41ec658715296fbfb56e69293333bf08bef3b1bc87d2278ae8aa9047e9fe232f",
+      "local_sha256": "41ec658715296fbfb56e69293333bf08bef3b1bc87d2278ae8aa9047e9fe232f"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/device/mx.py",
+      "copy": "mono1250/device/mx.py",
+      "sha256": "8b06223d21f429fc59e2f51c1346f6ae4566f9f98d5699099d740faaaeadb2c6",
+      "local_sha256": "8b06223d21f429fc59e2f51c1346f6ae4566f9f98d5699099d740faaaeadb2c6"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/device/ops.py",
+      "copy": "mono1250/device/ops.py",
+      "sha256": "d90d5856a6353ab4d4664b5c62c2e0616df5ac19f3b0e9a6096471bf7c0ff4ca",
+      "local_sha256": "3578b0a2661bc34a1b2073dcae8d21ec332894654478b5b20bb6e37969c811db"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/device/sync.py",
+      "copy": "mono1250/device/sync.py",
+      "sha256": "0c431cb6c1cc3e259f4170d096078a499e5a1a21aaf4a22ba01394afc0b045be",
+      "local_sha256": "0c431cb6c1cc3e259f4170d096078a499e5a1a21aaf4a22ba01394afc0b045be"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/index_plan.py",
+      "copy": "mono1250/index_plan.py",
+      "sha256": "1d5209a80d4592708c60a416a59941fffafbc521e647165618b27c7e07868fc3",
+      "local_sha256": "1d5209a80d4592708c60a416a59941fffafbc521e647165618b27c7e07868fc3"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/kernels/__init__.py",
+      "copy": "mono1250/kernels/__init__.py",
+      "sha256": "41ec658715296fbfb56e69293333bf08bef3b1bc87d2278ae8aa9047e9fe232f",
+      "local_sha256": "41ec658715296fbfb56e69293333bf08bef3b1bc87d2278ae8aa9047e9fe232f"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/kernels/attn_helpers.py",
+      "copy": "mono1250/kernels/attn_helpers.py",
+      "sha256": "d492ad4677e3ed6a5ecd5e3cf815b511478986b78d13e146b2e82008aac238f1",
+      "local_sha256": "d492ad4677e3ed6a5ecd5e3cf815b511478986b78d13e146b2e82008aac238f1"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/kernels/dims.py",
+      "copy": "mono1250/kernels/dims.py",
+      "sha256": "97b4687bae828fbb5d8c1050160085f101081d2045f72a1c19212a47634d2ea3",
+      "local_sha256": "97b4687bae828fbb5d8c1050160085f101081d2045f72a1c19212a47634d2ea3"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/kernels/reference_k1.py",
+      "copy": "mono1250/kernels/reference_k1.py",
+      "sha256": "95a7b6a8e2a2919832cab2199d3f261f7216623ce2f9fa9585724c5a766399b5",
+      "local_sha256": "95a7b6a8e2a2919832cab2199d3f261f7216623ce2f9fa9585724c5a766399b5"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/kernels/reference_norm.py",
+      "copy": "mono1250/kernels/reference_norm.py",
+      "sha256": "a9d7d78ac7293a20882cfea6f51b0aeed10dfc072431a92263ccdf08b6a88199",
+      "local_sha256": "a9d7d78ac7293a20882cfea6f51b0aeed10dfc072431a92263ccdf08b6a88199"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/kernels/reference_plan.py",
+      "copy": "mono1250/kernels/reference_plan.py",
+      "sha256": "a8cebe99b5f109241e155458e620190ca5731fd8a49957b3e9768172adcfd856",
+      "local_sha256": "a8cebe99b5f109241e155458e620190ca5731fd8a49957b3e9768172adcfd856"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/kernels/reference_projection.py",
+      "copy": "mono1250/kernels/reference_projection.py",
+      "sha256": "2f92f91bb9b5eecce1b225a10946900677ecc2ba783d43fdac3677c5f3c4c17b",
+      "local_sha256": "2f92f91bb9b5eecce1b225a10946900677ecc2ba783d43fdac3677c5f3c4c17b"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/kernels/reference_sync.py",
+      "copy": "mono1250/kernels/reference_sync.py",
+      "sha256": "96fd2f50e8f7e9f49b42ebc668beee9fdfdb87b2cb044ebec73b23ddb81ace03",
+      "local_sha256": "96fd2f50e8f7e9f49b42ebc668beee9fdfdb87b2cb044ebec73b23ddb81ace03"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/plan/__init__.py",
+      "copy": "mono1250/plan/__init__.py",
+      "sha256": "41ec658715296fbfb56e69293333bf08bef3b1bc87d2278ae8aa9047e9fe232f",
+      "local_sha256": "41ec658715296fbfb56e69293333bf08bef3b1bc87d2278ae8aa9047e9fe232f"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/plan/arith.py",
+      "copy": "mono1250/plan/arith.py",
+      "sha256": "c4f9475da212023e97697a0948667d175b07b5a2dd578bb5df156b8a46411420",
+      "local_sha256": "c4f9475da212023e97697a0948667d175b07b5a2dd578bb5df156b8a46411420"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/plan/check.py",
+      "copy": "mono1250/plan/check.py",
+      "sha256": "5045952dd2f799cfe65360938f7f29819d057e1c09fb9d8cccb384fb7c346835",
+      "local_sha256": "5045952dd2f799cfe65360938f7f29819d057e1c09fb9d8cccb384fb7c346835"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/plan/execution.py",
+      "copy": "mono1250/plan/execution.py",
+      "sha256": "2b1dd051eeb002d19a0ff43cbaadb8e5544fb11f6019f12c16b0e3a30d22ee45",
+      "local_sha256": "2b1dd051eeb002d19a0ff43cbaadb8e5544fb11f6019f12c16b0e3a30d22ee45"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/plan/layout.py",
+      "copy": "mono1250/plan/layout.py",
+      "sha256": "70e49202e6c58462627c7ab3cc2c9253ee7de61c125de79b35a6ed42e41734dc",
+      "local_sha256": "70e49202e6c58462627c7ab3cc2c9253ee7de61c125de79b35a6ed42e41734dc"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/plan/shard.py",
+      "copy": "mono1250/plan/shard.py",
+      "sha256": "bb44187af8ccc1e26070a14b781b0bb051d1b1be74e510bdd4dea2aa2d3ee73a",
+      "local_sha256": "bb44187af8ccc1e26070a14b781b0bb051d1b1be74e510bdd4dea2aa2d3ee73a"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/plan/trace.py",
+      "copy": "mono1250/plan/trace.py",
+      "sha256": "d261c8f14b0330a2f7834038f35a8be5e4711caee4cd3f13c2091065a4c74631",
+      "local_sha256": "d261c8f14b0330a2f7834038f35a8be5e4711caee4cd3f13c2091065a4c74631"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/runtime/__init__.py",
+      "copy": "mono1250/runtime/__init__.py",
+      "sha256": "41ec658715296fbfb56e69293333bf08bef3b1bc87d2278ae8aa9047e9fe232f",
+      "local_sha256": "41ec658715296fbfb56e69293333bf08bef3b1bc87d2278ae8aa9047e9fe232f"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/mono1250/runtime/compile.py",
+      "copy": "mono1250/runtime/compile.py",
+      "sha256": "b924f43f89fa1134a2aea09f622445b275c293089e7d3874529bb1ba25841dea",
+      "local_sha256": "b924f43f89fa1134a2aea09f622445b275c293089e7d3874529bb1ba25841dea"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/vendor_aiter/SOURCE.json",
+      "copy": "vendor_aiter/SOURCE.json",
+      "sha256": "01e0362b4e0e357c754bc6d10e93cf579aa7b6edac7fbfda6c26289490cbc253",
+      "local_sha256": "01e0362b4e0e357c754bc6d10e93cf579aa7b6edac7fbfda6c26289490cbc253"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/vendor_aiter/__init__.py",
+      "copy": "vendor_aiter/__init__.py",
+      "sha256": "e3407d79bbda411c5b31e6303f501633e424587b7b7b42daed4d4280e38380f6",
+      "local_sha256": "e3407d79bbda411c5b31e6303f501633e424587b7b7b42daed4d4280e38380f6"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/vendor_aiter/buffer_ops.py",
+      "copy": "vendor_aiter/buffer_ops.py",
+      "sha256": "da0a5d5b4e5b511e47ce3d1b4ddea3c4510108ab55e9b8b84e967c5bb18d8171",
+      "local_sha256": "da0a5d5b4e5b511e47ce3d1b4ddea3c4510108ab55e9b8b84e967c5bb18d8171"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/vendor_aiter/dpp_utils.py",
+      "copy": "vendor_aiter/dpp_utils.py",
+      "sha256": "e230529d0d2aea21a6c09731459c2bb2d61112b46fc6df537f082577237edab8",
+      "local_sha256": "e230529d0d2aea21a6c09731459c2bb2d61112b46fc6df537f082577237edab8"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/vendor_aiter/kernels_common.py",
+      "copy": "vendor_aiter/kernels_common.py",
+      "sha256": "7e78afb533d4e4bde1a34f73416404a94c5688891775cb0166ad61cf322a673b",
+      "local_sha256": "7e78afb533d4e4bde1a34f73416404a94c5688891775cb0166ad61cf322a673b"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/reference.py",
+      "copy": "reference.py",
+      "sha256": "c6fe7aa702c8defe017c89572a1cff612e52f07742b4b158daaf7289eef5eeb7",
+      "local_sha256": "c6fe7aa702c8defe017c89572a1cff612e52f07742b4b158daaf7289eef5eeb7"
+    },
+    {
+      "source": "/home/feifei/repo/ATOM/mono_test20/UPSTREAM_LICENSE",
+      "copy": "UPSTREAM_LICENSE",
+      "sha256": "0baca809927cad448401b252ce3bae12687c2987597ad7088cf3423f872d5bcd",
+      "local_sha256": "0baca809927cad448401b252ce3bae12687c2987597ad7088cf3423f872d5bcd"
+    }
+  ],
+  "hash_fields": {
+    "sha256": "source content when copied",
+    "local_sha256": "current isolated copy"
+  },
+  "local_changes": [
+    {
+      "file": "mono1250/device/ops.py",
+      "function": "fresh",
+      "change": "Replace nonempty v_mov inline asm with empty tied identity constraint (=v,0) for strict opaque-asm policy. Numeric identity retained; scheduling hint may differ."
+    }
+  ]
+}

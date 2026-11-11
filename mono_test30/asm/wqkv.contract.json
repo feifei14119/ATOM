@@ -1,0 +1,43 @@
+{
+  "schema": "mono_test30.external_asm_with_borrowed_lds.v1",
+  "symbol": "mono_wqkv_asm",
+  "target": "gfx1250",
+  "wavefront_size": 32,
+  "entry_exec": "full_wave",
+  "block_size": [256, 1, 1],
+  "arguments": [
+    {"name": "qkv_base", "type": "uint64", "register": "s[2:3]", "uniform": true},
+    {"name": "tag", "type": "uint32", "register": "s0", "uniform": true},
+    {"name": "xl_offset", "type": "uint32", "register": "s1", "uniform": true},
+    {"name": "red_offset", "type": "uint32", "register": "s4", "uniform": true},
+    {"name": "task", "type": "uint32", "register": "s5", "uniform": true},
+    {"name": "t0", "type": "uint32", "register": "v4"},
+    {"name": "n", "type": "uint32", "register": "s6", "uniform": true},
+    {"name": "weight_base", "type": "uint64", "register": "s[8:9]", "uniform": true},
+    {"name": "weight_scale_base", "type": "uint64", "register": "s[10:11]", "uniform": true},
+    {"name": "input_scale_base", "type": "uint64", "register": "s[12:13]", "uniform": true},
+    {"name": "input_base", "type": "uint64", "register": "s[14:15]", "uniform": true},
+    {"name": "tid", "type": "uint32", "register": "v0"},
+    {"name": "diag_base", "type": "uint64", "register": "s[16:17]", "uniform": true},
+    {"name": "failure_base", "type": "uint64", "register": "s[18:19]", "uniform": true},
+    {"name": "bid", "type": "uint32", "register": "s7", "uniform": true},
+    {"name": "poll_limit", "type": "uint32", "register": "s22", "uniform": true}
+  ],
+  "result": {"type": "void"},
+  "return_pc": "s[30:31]",
+  "clobbers": ["v[1:3]", "v[6:67]", "v95", "s[20:21]", "s[23:27]", "s40", "s48", "s63", "scc", "vcc"],
+  "uses": ["v[0:4]", "v[6:67]", "v95", "s[0:27]", "s[30:31]", "s40", "s48", "s63"],
+  "resources": {"vgpr_count": 96, "sgpr_count": 64, "private_bytes": 0, "lds_bytes": 0},
+  "borrowed_lds": {
+    "xl_offset": {"bytes": 5120, "alignment": 16, "entry_content": "unspecified"},
+    "red_offset": {"bytes": 512, "alignment": 16, "entry_content": "unspecified"},
+    "distinct_regions": true,
+    "allocation_owner": "Mono SharedAllocator; no independent callee allocation"
+  },
+  "specialization": {"hidden": 5120, "qkv_rows": 1792, "t0": 0, "n": 1, "task_range": [0, 111]},
+  "preserved_state": ["exec", "mode", "m0", "ttmp", "vgpr_bank_state", "s[30:39]"],
+  "memory": "read_write_global_and_borrowed_lds",
+  "leaf": true,
+  "audit_scope": "fixed C1 source and decoded register/control-flow audit; not a general external-ASM verifier",
+  "execution_status": "NOT_RUN"
+}

@@ -17,19 +17,21 @@ def stage(tag):
 
 
 def contract_tables(c):
-    out = ["| stage | 跨 asm 保留 V / S（R0） | 保留窗口 V / S | 最终构建跨 asm 活跃 V / S | asm 可用 VGPR | asm 可用 SGPR "
-           "| 可 clobber 的特殊寄存器 |",
-           "|---|---|---|---|---|---|---|"]
+    f = lambda d: f"{d['v']} / {d['s']}"
+    out = ["| stage | 调用前活跃 V / S | 调用后活跃 V / S | 跨调用须保留 V / S（R0 → 最终） | 入参绑定 V / S | 保留窗口 V / S "
+           "| 调用后 VGPR scratch | asm 可用 VGPR | asm 可用 SGPR（含可改写的入参） | 可 clobber 的特殊寄存器 |",
+           "|---|---|---|---|---|---|---|---|---|---|"]
     for tag, p in c["points"].items():
-        w, a, f = p["window"], p["asm"], p["through_final"]
-        out.append(f"| `{stage(tag)}` | {p['keep_r0']['v']} / {p['keep_r0']['s']} | {w['v']} / {w['s']} | "
-                   f"{f['v']} / {f['s']} | "
+        w, a = p["window"], p["asm"]
+        out.append(f"| `{stage(tag)}` | {f(p['before_final'])} | {f(p['after_final'])} | "
+                   f"{f(p['keep_r0'])} → {f(p['through_final'])} | {p['inputs_v']} / {p['inputs_s']} | "
+                   f"{w['v']} / {w['s']}：`{w['v_regs']}` `{w['s_regs']}` | {p['vgpr_scratch_after'] or ''} | "
                    f"**{a['v']}**：`{a['v_regs']}` | **{a['s']}**：`{a['s_regs']}` | "
                    f"{' '.join(f'`{x}`' for x in a['x']) or '无'} |")
-    out += ["", "| stage | 输入（只读 VGPR / 可改写 SGPR） | 输入 SGPR 数 |", "|---|---|---|"]
+    out += ["", "| stage | 入参绑定（VGPR 只读 / SGPR 可改写） |", "|---|---|"]
     for tag, p in c["points"].items():
         ins = " ".join(f"`{b['name']}={b['reg']}`" for b in p["inputs"])
-        out.append(f"| `{stage(tag)}` | {ins} | {p['inputs_s']} |")
+        out.append(f"| `{stage(tag)}` | {ins} |")
     return out
 
 
@@ -54,9 +56,10 @@ def main():
     out = []
     if c:
         out += ["## 契约（替换后的 kernel）", "",
-                f"R0（替换、无 clobber）溢出 {c['spills_r0']}，最终 {c['spills_final']}"
-                f"（VGPR scratch 指令数、SGPR↔VGPR lane 指令数、承载 SGPR 溢出的 WWM VGPR），"
-                f"容差 VGPR {c.get('vtol')} / SGPR {c.get('stol')}；最终 notes {c['notes_final']}", ""]
+                f"SGPR spill：R0（替换、无 clobber）{c['spills_r0']['sgpr']}，最终 {c['spills_final']['sgpr']}（硬性要求为 0）；"
+                f"VGPR scratch 指令：R0 {c['spills_r0']['vgpr']}，最终 {c['spills_final']['vgpr']}"
+                f"（按所在区域 {c['vgpr_scratch_final_by_region']}）；SGPR 窗口全局余量 {c['sgpr_slack']}；"
+                f"最终 notes {c['notes_final']}", ""]
         out += contract_tables(c) + [""]
     if a:
         out += ["## 原生 kernel 的活跃寄存器", "", f"预留 {a['reserved']}，溢出 {a['spills']}", ""]

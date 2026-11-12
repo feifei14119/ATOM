@@ -4,10 +4,12 @@
   analyze   the native kernel (every stage wrapped by markers): registers live just before / after each insertion
             point and through each stage, from post-RA MIR (the register allocator's own liveness)
   contract  every stage of --replace becomes one asm with its real inputs (v0 = t read-only, SGPRs tied: the asm
-            may overwrite them); per insertion point, the smallest kept window (VGPRs at the top of v0..v{limit-1},
-            SGPRs at the top of the usable ones) with which the kernel compiles with no new VGPR for SGPR spill
-            lanes, at most --stol more SGPR lane spill and --vtol more VGPR scratch instructions than with no
-            clobber: the asm owns every other register
+            may overwrite them) that clobbers every register outside its kept window. SGPR spill (to VGPR lanes or
+            to scratch) is forbidden: none in the build with no clobber (else an error with the spill sites), none
+            in the final one. Kept window per insertion point: VGPRs = those live across it (+ --vslack; the top of
+            v0..v{limit-1}; what does not fit goes to scratch, a warning), SGPRs = those live across it plus the
+            smallest slack with no SGPR spill (the top of the usable ones). Report: live before / after / across,
+            input bindings, the asm's registers
   verify    GPU run of the analyze build whose markers overwrite every register the analysis reports dead, each
             declared clobbered (the post-RA scheduler moves ALU code across an asm with no register dependency on
             it), vs a golden run; the allocation must stay the native one (checked); a negative control also
@@ -69,6 +71,8 @@ def build(plan, out, args, run=False, extra=()):
     (out / "plan.json").write_text(json.dumps(plan))
     e = env(args.llvm)
     e.update(GPRTOOL_PLAN=str(out / "plan.json"), GPRTOOL_BIND=str(out / "bind.json"), FLYDSL_DUMP_DIR=str(out / "dump"))
+    if args.patch:
+        e["GPRTOOL_PATCH"] = str(Path(args.patch).resolve())
     if not run:
         e["COMPILE_ONLY"] = "1"
     cmd = [sys.executable, str(HERE / "probe.py"), "--rows", str(args.rows), "--layers", str(args.layers),
@@ -128,19 +132,34 @@ def cmd_analyze(args):
             "out_before": S(o["before"], reserved), "out_after": S(o["after"], reserved),
             "through": S(through, reserved), "through_remat": S(mir.remat_units(blocks, (i["block"], i["index"]), through)),
         }
+    sp = spills(out)
+    res["vgpr_scratch_by_region"] = by_region(sp["sites"], "vgpr")
+    res["sgpr_spill_sites"] = [s for s in sp["sites"] if s["kind"].startswith("sgpr")]
     (Path(args.work) / "analyze.json").write_text(json.dumps(res, indent=1))
     log(f"analyze: {len(res['points'])} insertion points, reserved {sorted(reserved)}, spills {res['spills']}")
+    if sp["vgpr"]:
+        log(f"WARNING: VGPR scratch {sp['vgpr']} instructions, by region: {res['vgpr_scratch_by_region']}")
+    if sp["sgpr"] or sp["wwm"]:
+        sgpr_spill_error(sp, "native kernel")
+        sys.exit(2)
 
 
 # ------------------------------------------------------------------ contract (replaced stages)
-def windows(K, reserved, limit, usable_s):
-    """Per tag: the kept VGPR window (top of v0..limit-1, reserved WWM registers inside it) and SGPR window (top of
-    the usable SGPRs)."""
+def windows(K, reserved, limit, usable_s, layout="top"):
+    """Per tag: the kept VGPR window and SGPR window (top of the usable SGPRs). VGPRs: "top": the top K of
+    v0..limit-1 plus the WWM registers (SGPR spill lanes) where R0 put them; "top-packed": the top K + number of WWM
+    registers, which move into it; "low": v1..v{K + number of WWM registers}. With the last two the asm's VGPRs
+    are one contiguous range."""
     rv = split(reserved)[0]
     w = {}
     for tag, (kv, ks) in K.items():
-        top = [n for n in range(limit - 1, -1, -1) if n not in rv][:kv]
-        vw = sorted(set(top) | set(rv))
+        if layout == "low":
+            vw = list(range(1, 1 + kv + len(rv)))
+        elif layout == "top-packed":
+            vw = list(range(limit - kv - len(rv), limit))
+        else:
+            top = [n for n in range(limit - 1, -1, -1) if n not in rv][:kv]
+            vw = sorted(set(top) | set(rv))
         sw = usable_s[len(usable_s) - ks:] if ks else []
         w[tag] = (vw, sw)
     return w
@@ -167,13 +186,29 @@ def read_only(binds):
     return {u for b in binds if not b.get("writable", True) for u in expand(b["reg"])}
 
 
-def spill_key(out):
-    """(VGPR scratch spill/restore instructions, SGPR <-> VGPR-lane spill instructions, the WWM VGPRs holding the
-    SGPR spill lanes) of a build."""
-    blocks, _, res = mir.parse(Path(out) / "post.mir")
+def spills(out):
+    """Spill instructions of a build: counts per kind (+ "sgpr", "vgpr" totals), the WWM VGPRs (SGPR spill lanes),
+    the sites (region = the last marker before the instruction)."""
+    blocks, order, res = mir.parse(Path(out) / "post.mir")
     c = mir.spill_counts(blocks)
-    return (c["vgpr_scratch_save"] + c["vgpr_scratch_restore"] + c.get("sgpr_scratch_save", 0),
-            c["sgpr_to_vgpr_lane"] + c["sgpr_from_vgpr_lane"], split(res)[0])
+    return dict(sgpr=c["sgpr"], vgpr=c["vgpr"], counts=c, wwm=split(res)[0],
+                sites=mir.spill_sites(blocks, order, tag_of("gpr")))
+
+
+def by_region(sites, prefix):
+    r = {}
+    for s in sites:
+        if s["kind"].startswith(prefix):
+            r[s["region"] or "(entry)"] = r.get(s["region"] or "(entry)", 0) + 1
+    return r
+
+
+def sgpr_spill_error(sp, where):
+    log(f"ERROR {where}: {sp['sgpr']} SGPR spill instructions {sp['counts']} (SGPR spill is forbidden; with "
+        f"--patch patches/zero_sgpr_spill.py the native kernel has none). Sites (region: defining instruction):")
+    for s in sp["sites"]:
+        if s["kind"] in ("sgpr_to_vgpr_lane", "sgpr_scratch_save"):
+            log(f"  {s['region']}: {s['defn']}")
 
 
 def cmd_contract(args):
@@ -184,8 +219,14 @@ def cmd_contract(args):
     binds = json.loads((work / "c_r0" / "bind.json").read_text())["bindings"]
     reserved = set(reserved) | {"s102", "s103"}
     usable_s = [n for n in range(106) if f"s{n}" not in reserved]
-    key0 = spill_key(work / "c_r0")
-    log(f"r0: reserved {sorted(reserved)}, spills (vgpr scratch, sgpr lane, wwm vgprs) {key0}")
+    sp0 = spills(work / "c_r0")
+    log(f"r0: reserved {sorted(reserved)}, spills {sp0['counts']}")
+    if sp0["sgpr"] or sp0["wwm"]:
+        # every asm clobbers what is not kept: no window can make room for SGPRs the kernel spills with no clobber
+        sgpr_spill_error(sp0, "r0 (stages replaced, no clobber)")
+        (work / "contract.json").write_text(json.dumps(
+            {"error": "sgpr spill in r0", "spills_r0": sp0["counts"], "sites_r0": sp0["sites"]}, indent=1))
+        sys.exit(2)
     K, R, X = {}, {}, {}
     for tag, es in at.items():
         if ":" in tag:
@@ -199,77 +240,86 @@ def cmd_contract(args):
         K[tag] = (len(v), len(s))
         R[tag] = (len(v) - len(rv), len(s) - len(rs))
         X[tag] = [x for x in XCLOB if x not in o]
-    # windows K + slack: the global SGPR slack (VGPR windows loose), then the global VGPR slack, then per point back
-    # to no slack where that keeps the spills
-    hist, n, good = [], [0], {}
+    # VGPR windows: exactly the kept VGPRs (what does not fit goes to scratch: a warning). SGPR windows: the kept
+    # SGPRs, plus the smallest global slack with no SGPR spill, then per point back to no slack where that keeps none
+    hist, n = [], [0]
+    nin = {t: len({u for b in binds.get(t, []) for u in expand(b["reg"]) if u[0] == "s"}) for t in K}
 
     def trial(cur):
         name = f"c_try{n[0]}"
         n[0] += 1
-        W = windows(cur, reserved, args.limit, usable_s)
+        W = windows(cur, reserved, args.limit, usable_s, args.vlayout)
         info = build(contract_plan(base, W, binds, args.limit, usable_s, X), work / name, args)
-        k = spill_key(work / name) if info["built"] else None
-        hist.append(dict(name=name, windows={t: list(v) for t, v in cur.items()}, spills=k, notes=info.get("notes")))
-        log(f"{name}: spills {k} (r0 {key0})")
-        if ok(k):
-            good[name] = cur
-        return k, name
+        sp = spills(work / name) if info["built"] else None
+        good = sp is not None and sp["sgpr"] == 0 and not sp["wwm"]
+        hist.append(dict(name=name, windows={t: list(v) for t, v in cur.items()}, notes=info.get("notes"),
+                         spills=sp and sp["counts"], wwm=sp and sp["wwm"], ok=good))
+        log(f"{name}: {'ok' if good else 'REJECTED'} spills {sp and sp['counts']}")
+        return good, name
 
-    def ok(k):
-        return (k is not None and k[0] <= key0[0] + args.vtol and k[1] <= key0[1] + args.stol
-                and set(k[2]) <= set(key0[2]))
+    def slack(ds):
+        return {t: (min(K[t][0] + args.vslack, args.limit - 1), min(K[t][1] + ds, len(usable_s) - nin[t])) for t in K}
 
-    nin = {t: len({u for b in binds.get(t, []) for u in expand(b["reg"]) if u[0] == "s"}) for t in K}
-
-    def slack(dv, ds):
-        return {t: (min(K[t][0] + dv, args.limit - 1 - len(key0[2])), min(K[t][1] + ds, len(usable_s) - nin[t]))
-                for t in K}
-
-    ds = next((d for d in (0, 2, 4, 6, 8, 12, 16, 24, 32) if ok(trial(slack(16, d))[0])), None)
-    assert ds is not None, "no SGPR slack keeps the SGPR spills"
-    dv = next((d for d in (0, 2, 4, 8) if ok(trial(slack(d, ds))[0])), 16)
-    cur = slack(dv, ds)
-    final = next(nm for nm, w in reversed(list(good.items())) if w == cur) if cur in good.values() else None
+    final = None
+    for ds in (0, 2, 4, 6, 8, 12, 16, 24, 32):
+        good, final = trial(slack(ds))
+        if good:
+            break
+    else:
+        sgpr_spill_error(spills(work / final), f"{final} (SGPR slack {ds})")
+        sys.exit(2)
+    cur = slack(ds)
     for t in K:
-        if cur[t][0] > K[t][0]:
-            k, nm = trial({**cur, t: (K[t][0], cur[t][1])})
-            if ok(k):
-                cur, final = {**cur, t: (K[t][0], cur[t][1])}, nm
         for s in sorted({K[t][1], (K[t][1] + cur[t][1]) // 2}):
             if s >= cur[t][1]:
                 continue
-            k, nm = trial({**cur, t: (cur[t][0], s)})
-            if ok(k):
+            good, nm = trial({**cur, t: (cur[t][0], s)})
+            if good:
                 cur, final = {**cur, t: (cur[t][0], s)}, nm
                 break
-    want = cur
-    log(f"slack: sgpr {ds}, vgpr {dv}; final windows {want}")
+    log(f"sgpr slack {ds}; final windows {cur}")
     shutil.copytree(work / final, work / "c_final", dirs_exist_ok=True)
     b2, o2, res2, at2 = liveness(work / "c_final")
-    W = windows(want, reserved, args.limit, usable_s)
-    res = {"limit": args.limit, "reserved_r0": sorted(reserved), "reserved_final": sorted(res2), "spills_r0": key0,
-           "spills_final": spill_key(work / "c_final"), "vtol": args.vtol, "stol": args.stol, "notes_r0": r0.get("notes"),
+    spf = spills(work / "c_final")
+    assert spf["sgpr"] == 0 and not spf["wwm"], spf["counts"]
+    W = windows(cur, reserved, args.limit, usable_s, args.vlayout)
+    res = {"limit": args.limit, "vlayout": args.vlayout, "reserved_r0": sorted(reserved),
+           "reserved_final": sorted(res2), "spills_r0": sp0["counts"], "spills_final": spf["counts"],
+           "vgpr_scratch_r0_by_region": by_region(sp0["sites"], "vgpr"),
+           "vgpr_scratch_final_by_region": by_region(spf["sites"], "vgpr"),
+           "sgpr_slack": ds, "vslack": args.vslack, "notes_r0": r0.get("notes"),
            "notes_final": json.loads((work / "c_final" / "info.json").read_text()).get("notes"), "history": hist,
            "points": {}}
     for tag in K:
         vw, sw = W[tag]
         e = at2[tag][0]
-        th2 = (e["after"] - e["defs"])
         b = binds.get(tag, [])
         ro = read_only(b)
+        ins = {u for x in b for u in expand(x["reg"])}
+        th2 = e["after"] - e["defs"]
+        tv, ts, _ = split(set(th2) - set(res2) - reserved - ro)
+        outside = [f"v{n}" for n in tv if n not in vw] + [f"s{n}" for n in ts if n not in sw]
         asm_v = [n for n in range(args.limit) if n not in vw and f"v{n}" not in ro]
         asm_s = [n for n in usable_s if n not in sw]
         res["points"][tag] = {
-            "inputs": b, "inputs_s": sum(len(expand(x["reg"])) for x in b if x["reg"][0] == "s"),
-            "inputs_v": sum(1 for x in b if x["reg"][0] == "v"),
+            "inputs": b, "inputs_s": len({u for u in ins if u[0] == "s"}), "inputs_v": len({u for u in ins if u[0] == "v"}),
             "keep_r0": dict(v=K[tag][0], s=K[tag][1]), "keep_r0_noremat": dict(v=R[tag][0], s=R[tag][1]),
+            # final build, just before / after the asm (before: kept + inputs; after: kept + read-only inputs)
+            "before_final": S(e["before"], res2), "after_final": S(e["after"], res2),
             "window": dict(v=len(vw), s=len(sw), v_regs=ranges(vw, "v"), s_regs=ranges(sw, "s")),
             "asm": dict(v=len(asm_v), s=len(asm_s), v_regs=ranges(asm_v, "v"), s_regs=ranges(asm_s, "s"),
                         x=X[tag]),
-            "through_final": S(th2, res2),
+            "through_final": S(th2, res2), "outside_window": outside,
+            "vgpr_scratch_after": by_region(spf["sites"], "vgpr").get(tag, 0),
         }
+        if outside:
+            log(f"ERROR {tag}: live across the asm outside its window {outside}")
     (work / "contract.json").write_text(json.dumps(res, indent=1))
-    log(f"contract: final {final}, spills {res['spills_final']} (r0 {key0})")
+    dv = spf["vgpr"] - sp0["vgpr"]
+    log(f"contract: final {final}, SGPR spills 0, VGPR scratch {spf['vgpr']} instructions (r0 {sp0['vgpr']})")
+    if spf["vgpr"]:
+        log(f"WARNING: VGPR scratch {spf['vgpr']} instructions ({dv:+d} vs r0), by region (after which marker): "
+            f"{res['vgpr_scratch_final_by_region']}")
 
 
 # ------------------------------------------------------------------ verify (GPU run, overwrite dead registers)
@@ -361,10 +411,10 @@ def main():
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--limit", type=int, default=512, help="VGPRs of the asm contracts: v0..v{limit-1}")
     ap.add_argument("--replace", nargs="+", default=TIER1)
-    ap.add_argument("--vtol", type=int, default=16, help="contract: VGPR scratch spill/restore instructions allowed "
-                    "above the no-clobber build")
-    ap.add_argument("--stol", type=int, default=16, help="contract: SGPR <-> VGPR-lane spill instructions allowed "
-                    "above the no-clobber build (no new VGPR for SGPR spill lanes in any case)")
+    ap.add_argument("--patch", help="python file run in the build before tracing (kernel monkeypatches, see patches/)")
+    ap.add_argument("--vlayout", choices=("top", "top-packed", "low"), default="top", help="contract: where the kept VGPR window goes (see windows())")
+    ap.add_argument("--vslack", type=int, default=0, help="contract: VGPRs kept beyond those live across each "
+                    "insertion point (fewer VGPR scratch instructions, fewer VGPRs for the asm)")
     ap.add_argument("--negative", default="stage_E#0:in")
     ap.add_argument("--only", nargs="*", help="verify: poison only at the tags matching these regexes")
     ap.add_argument("--vrange", type=int, nargs=2, default=[0, 1024], help="verify: poison VGPRs in [lo, hi) only")

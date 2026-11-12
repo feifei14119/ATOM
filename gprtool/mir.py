@@ -139,22 +139,56 @@ def region_defs(blocks, start, stop):
     return defs
 
 
+SPILL_KINDS = ("sgpr_to_vgpr_lane", "sgpr_from_vgpr_lane", "sgpr_scratch_save", "sgpr_scratch_restore",
+               "vgpr_scratch_save", "vgpr_scratch_restore")
+
+
+def spill_kind(op):
+    if op.startswith("SI_SPILL_S") and "TO_VGPR" in op:
+        return "sgpr_to_vgpr_lane"
+    if op.startswith("SI_RESTORE_S"):
+        return "sgpr_from_vgpr_lane"
+    if op.startswith("SI_SPILL_S"):
+        return "sgpr_scratch_save" if op.endswith("_SAVE") else "sgpr_scratch_restore"
+    if op.startswith("SI_SPILL_V") or op.startswith("SI_SPILL_AV"):
+        return "vgpr_scratch_save" if op.endswith("_SAVE") else "vgpr_scratch_restore"
+    return None
+
+
 def spill_counts(blocks):
-    c = {"sgpr_to_vgpr_lane": 0, "sgpr_from_vgpr_lane": 0, "vgpr_scratch_save": 0, "vgpr_scratch_restore": 0}
+    c = dict.fromkeys(SPILL_KINDS, 0)
     for blk in blocks.values():
         for ins in blk["instrs"]:
-            if ins.op.startswith("SI_SPILL_S") and "TO_VGPR" in ins.op:
-                c["sgpr_to_vgpr_lane"] += 1
-            elif ins.op.startswith("SI_RESTORE_S"):
-                c["sgpr_from_vgpr_lane"] += 1
-            elif ins.op.startswith("SI_SPILL_V") and ins.op.endswith("_SAVE"):
-                c["vgpr_scratch_save"] += 1
-            elif ins.op.startswith("SI_SPILL_V") and ins.op.endswith("_RESTORE"):
-                c["vgpr_scratch_restore"] += 1
-            elif ins.op.startswith("SI_SPILL_S") and ins.op.endswith("_SAVE"):
-                c.setdefault("sgpr_scratch_save", 0)
-                c["sgpr_scratch_save"] += 1
+            k = spill_kind(ins.op)
+            if k:
+                c[k] += 1
+    c["sgpr"] = sum(v for k, v in c.items() if k.startswith("sgpr_"))
+    c["vgpr"] = c["vgpr_scratch_save"] + c["vgpr_scratch_restore"]
     return c
+
+
+def spill_sites(blocks, order, match):
+    """Every spill / restore instruction: dict(kind, block, region = the last marker before it in layout order,
+    text, def = for an SGPR spill, the instruction (same block) that last defined the spilled register)."""
+    out, region = [], None
+    for b in order:
+        ins = blocks[b]["instrs"]
+        for i, x in enumerate(ins):
+            if x.asm is not None and match(x.asm) is not None:
+                region = match(x.asm)
+                continue
+            kind = spill_kind(x.op)
+            if kind is None:
+                continue
+            d = None
+            if kind in ("sgpr_to_vgpr_lane", "sgpr_scratch_save"):
+                src = x.uses - x.defs
+                for k in range(i - 1, -1, -1):
+                    if (ins[k].defs | ins[k].pdefs) & src and not ins[k].op.startswith("SI_"):
+                        d = ins[k].text.split(" :: ")[0][:160]
+                        break
+            out.append(dict(kind=kind, block=b, region=region, text=x.text.split(" :: ")[0][:120], defn=d))
+    return out
 
 
 def remat_units(blocks, at, us):

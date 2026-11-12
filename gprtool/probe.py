@@ -12,13 +12,16 @@ only when it reads a VGPR and otherwise assumes the asm keeps it: an asm that sw
 entry and restores it at exit (poison_text).
 plan["contracts"][tag]: clobber_v / clobber_s (register numbers), clobber_x (vcc, scc, ...): the clobber list;
                         poison_v / poison_s: registers the asm overwrites with 0xDEAD0000 + n (runtime check).
-The bindings are written to GPRTOOL_BIND (json). Run: GPRTOOL_PLAN=plan.json python3 probe.py [run_test.py args]
+The bindings are written to GPRTOOL_BIND (json). GPRTOOL_PATCH: a python file run before the kernel modules are wrapped
+(monkeypatches of the kernel sources for experiments, no ATOM source edit).
+Run: GPRTOOL_PLAN=plan.json python3 probe.py [run_test.py args]
 """
 import collections
 import functools
 import importlib
 import json
 import os
+import runpy
 import sys
 from pathlib import Path
 
@@ -207,6 +210,8 @@ def wrap(mod, name):
 
 
 def main():
+    if os.environ.get("GPRTOOL_PATCH"):
+        runpy.run_path(os.environ["GPRTOOL_PATCH"], run_name="gprtool_patch")
     for m, n in TARGETS:
         wrap(importlib.import_module(PKG + m), n)
     sys.argv = [sys.argv[0], "--stagec", "native"] + sys.argv[1:]

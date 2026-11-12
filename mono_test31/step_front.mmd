@@ -1,0 +1,26 @@
+flowchart TD
+    H0["hf=0<br/>L313"] --> FIRST{"hf == 0?<br/>L315–316"}
+    FIRST -- 是 --> PF["7 个 4KiB 窗口的指令预取<br/>L317–323"]
+    FIRST -- 否 --> CTA
+    PF --> CTA{"bid &lt; FRONT_CTAS?<br/>L325–326"}
+    CTA -- 是 --> WAIT["front_wait：hf0 等 TP1，hf1 等 TP2<br/>内部按 column group 等 16 个 CTA 的发布<br/>L327–331"]
+    WAIT --> FRONT["front：hf0 FFN front，hf1 attention front<br/>片段内部仍有末层、tap、Engram 等条件<br/>L332–336"]
+    CTA -- 否：跳过等待和 front --> FFN
+    FRONT --> FFN{"hf == 0?<br/>L338–339"}
+    FFN -- 是 --> SH["shared_early：所有 CTA 进入此片段<br/>内部筛选 early shared 的空闲 CTA，等待 X8_PUB<br/>L340–344"]
+    SH --> PM["4 个 4KiB 窗口的指令预取<br/>L345–348"]
+    PM --> HF["handoff_front：所有 CTA 参与<br/>L349–353"]
+    HF --> MOE["moe<br/>L354–358"]
+    MOE --> HM["handoff_moe_done<br/>L359–363"]
+    HM --> TP["moe_combine_tp2<br/>combine + TP2 allreduce + 分组发布<br/>L364–368"]
+    FFN -- 否：hf1 跳过 shared/MoE/TP2 --> INC
+    TP --> INC["++hf<br/>L370"]
+    INC --> MORE{"hf &lt; 2?<br/>L371–372"}
+    MORE -- 是 --> FIRST
+    MORE -- 否 --> DONE["返回单层图：handoff_layer_end<br/>L373–377；此时 hf=2"]
+    classDef runtime fill:#e1f3df,stroke:#34733a,color:#222;
+    classDef stage fill:#e4efff,stroke:#466fa7,color:#222;
+    classDef sync fill:#efe4ff,stroke:#7a50a0,color:#222;
+    class FIRST,CTA,FFN,MORE runtime;
+    class FRONT,SH,MOE,TP stage;
+    class WAIT,HF,HM,DONE sync;

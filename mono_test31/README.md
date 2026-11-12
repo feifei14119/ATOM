@@ -9,7 +9,13 @@
 | 文件 | 内容 |
 | --- | --- |
 | `step.s` | ASM 入口、cluster CTA ID 解码、target/draft 切换、layer/hf/pi 循环、lflags 分支、前端 CTA 范围和阶段顺序。 |
+| [step_pseudocode.hip.cpp](step_pseudocode.hip.cpp) | 逐段对应 `step.s` 行号的 HIP 风格解释性伪代码，不能直接编译。 |
+| [STEP_EXPLAINED.md](STEP_EXPLAINED.md) | 寄存器映射、分支/循环、阶段内部逻辑和同步语义说明，包含三张流程图。 |
+| [step_py_pseudocode.hip.cpp](step_py_pseudocode.hip.cpp) | 仅含原始 `step.py` 的 `body` 伪代码，带参数说明和 Python 源文件行号。 |
+| [STEP_PY_EXPLAINED.md](STEP_PY_EXPLAINED.md) | 原 `body` 的参数与逻辑说明，并对照 `step.py` 和 `step.s` 的阶段位置。 |
+| [step_overview.mmd](step_overview.mmd)、[step_layer.mmd](step_layer.mmd)、[step_front.mmd](step_front.mmd) | 总调度、单层和两遍 front 的独立 Mermaid 流程图源文件。 |
 | `fragments.py` | 从经过 SHA256 固定的 `step.py` 提取计算阶段，保留原来的 LazyC、front callbacks 和复杂表达式。 |
+| [FLYDSL_SOURCE_MAP.md](FLYDSL_SOURCE_MAP.md) | `step.s` 全部 43 个 FlyDSL 片段的原函数、Python/ASM 行号、适配方式和实际函数定义位置。 |
 | `export.py` | 在 FlyDSL 编译期间捕获 tracing container，转成普通 LLVM CCC 函数，替换内层 helper 的 thread/CTA ID，然后由 LLVM 编译。 |
 | `native.py` | 提取完整 native 函数体，保留寄存器保存/恢复与 scratch，重命名局部标签，将 return 改为片段出口跳转。 |
 | `build.py` | 展开 `.flydsl.*`，合并资源，生成 descriptor/metadata，汇编、链接并输出构建报告。 |

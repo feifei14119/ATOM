@@ -1,0 +1,42 @@
+flowchart TD
+    INIT["入口、ABI、CTA ID、初始状态<br/>L62–83"] --> EB["epoch_begin；从 LDS 取 epoch<br/>L84–95"]
+    EB --> PART{"构建条件<br/>STEP_PART == draft?<br/>L96–102"}
+    PART -- 是 --> HASD{"构建条件<br/>DRAFT_LAYERS > 0?<br/>L97–101"}
+    HASD -- 否 --> EE
+    HASD -- 是 --> DE
+    PART -- 否 --> TE["target entry：segment=0，layer=0<br/>end=TARGET_LAYERS，TRx=TARGET_ROWS<br/>L104–108"]
+    TE --> TS["target_state + handoff_target_state<br/>L109–118"]
+    TS --> TB{"bid &lt; FRONT_CTAS?<br/>L119–120"}
+    TB -- 是 --> TF["target_front<br/>L121–125"]
+    TB -- 否 --> TH
+    TF --> TH["handoff_target_front；跳到层循环<br/>L127–132"]
+    TH --> LOOP
+    DE["draft entry：segment=1，layer=TARGET_LAYERS<br/>end=TARGET_LAYERS+DRAFT_LAYERS<br/>TRx=DRAFT_ROWS；L134–138"] --> B0{"bid == 0?<br/>L139–140"}
+    B0 -- 是 --> DM["draft_meta<br/>L141–145"]
+    B0 -- 否 --> DS
+    DM --> DS["draft_state + handoff_draft_state<br/>L147–156"]
+    DS --> DB{"bid &lt; FRONT_CTAS?<br/>L157–158"}
+    DB -- 是 --> DF["draft_front<br/>L159–163"]
+    DB -- 否 --> DH
+    DF --> DH["handoff_draft_front<br/>L165–169"]
+    DH --> LOOP["当前 segment 的层循环<br/>含 layer / pi / hf 循环，详见 step_layer.mmd<br/>L171–395；零层直接进入 segment tail"]
+    LOOP --> SEG{"segment == draft?<br/>L397–399"}
+    SEG -- 是 --> DTC{"构建条件<br/>DRAFT_LAYERS > 0 且 PART != target?<br/>L413–419"}
+    DTC -- 是 --> DT["draft_tail<br/>L414–418"]
+    DTC -- 否 --> EE
+    DT --> EE
+    SEG -- 否 --> TTC{"构建条件<br/>PART == target 或 DRAFT_LAYERS > 0?<br/>L400–406"}
+    TTC -- 是 --> TT["target_tail<br/>L401–405"]
+    TTC -- 否 --> NEXT
+    TT --> NEXT{"构建条件<br/>PART == all 且 DRAFT_LAYERS > 0?<br/>L407–411"}
+    NEXT -- 是 --> DE
+    NEXT -- 否 --> EE["epoch_end<br/>L420–425"]
+    EE --> END["s_endpgm<br/>L426"]
+    classDef compile fill:#fff0c2,stroke:#ad7900,color:#222;
+    classDef runtime fill:#e1f3df,stroke:#34733a,color:#222;
+    classDef stage fill:#e4efff,stroke:#466fa7,color:#222;
+    classDef sync fill:#efe4ff,stroke:#7a50a0,color:#222;
+    class PART,HASD,DTC,TTC,NEXT compile;
+    class TB,B0,DB,SEG runtime;
+    class EB,TF,DM,DF,LOOP,TT,DT,EE stage;
+    class TS,TH,DS,DH sync;

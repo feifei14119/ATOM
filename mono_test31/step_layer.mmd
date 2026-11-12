@@ -1,0 +1,50 @@
+flowchart TD
+    CHECK{"入口检查：layer &lt; end?<br/>L171–173"}
+    CHECK -- 否 --> TAIL["返回总图的 segment tail<br/>L397"]
+    CHECK -- 是 --> LOAD["加载本层 lflags；layer_stamp_start<br/>L175–181"]
+    LOAD --> EQ{"target 且 bit7?<br/>L182–185"}
+    EQ -- 是 --> ENGQ["engq<br/>L186–190"]
+    EQ -- 否 --> A
+    ENGQ --> A["attention_A + handoff_A<br/>L192–201"]
+    A --> EK{"target 且 bit7?<br/>L202–205"}
+    EK -- 是 --> ENGKV["engkv<br/>L206–210"]
+    EK -- 否 --> KV
+    ENGKV --> KV["kv_C<br/>L212–216"]
+    KV --> IP{"target 且 bit3?<br/>L217–220"}
+    IP -- 是 --> PREP["index_prepare<br/>L221–225"]
+    IP -- 否 --> KH
+    PREP --> KH["handoff_KV_C：无条件汇合<br/>L227–231"]
+    KH --> IQ{"target 且 bit3?<br/>L232–235"}
+    IQ -- 否 --> D
+    IQ -- 是 --> QUANT["index_quant + handoff_quant<br/>L236–245"]
+    QUANT --> IB{"ibat 的 64-bit 值 != 0?<br/>L246–249"}
+    IB -- 否 --> D
+    IB -- 是 --> SCORE["index_score + handoff_score<br/>L250–259"]
+    SCORE --> P0["pi=0；npass=IDX_LEVELS=2<br/>L260–261"]
+    P0 --> RX{"bit6：REINDEX?<br/>L262–263"}
+    RX -- 是 --> SEL
+    RX -- 否 --> PROD{"bit5：candidate producer?<br/>L264–265"}
+    PROD -- 否 --> SEL
+    PROD -- 是 --> P4["npass=2*IDX_LEVELS=4<br/>L266"]
+    P4 --> SEL["index_select + handoff_select<br/>L267–277"]
+    SEL --> PI["++pi<br/>L278"]
+    PI --> MOREP{"pi &lt; npass?<br/>L279–280"}
+    MOREP -- 是 --> SEL
+    MOREP -- 否 --> D["attention_D + handoff_D<br/>L282–291"]
+    D --> E["attention_E + handoff_E<br/>L292–301"]
+    E --> F["attention_F + tp1<br/>L302–311"]
+    F --> FRONT["两遍 front 子流程，详见 step_front.mmd<br/>hf=0：FFN/MoE/TP2；hf=1：下一层 attention front<br/>L313–372"]
+    FRONT --> LH["handoff_layer_end<br/>L373–377"]
+    LH --> TAPC{"target 且 bit4?<br/>L378–381"}
+    TAPC -- 是 --> TAP["tap<br/>L382–386"]
+    TAPC -- 否 --> STAMP
+    TAP --> STAMP["layer_stamp_end；++layer<br/>L388–393"]
+    STAMP --> MOREL{"layer &lt; end?<br/>L394–395"}
+    MOREL -- 是 --> LOAD
+    MOREL -- 否 --> TAIL
+    classDef runtime fill:#e1f3df,stroke:#34733a,color:#222;
+    classDef stage fill:#e4efff,stroke:#466fa7,color:#222;
+    classDef sync fill:#efe4ff,stroke:#7a50a0,color:#222;
+    class CHECK,EQ,EK,IP,IQ,IB,RX,PROD,MOREP,TAPC,MOREL runtime;
+    class ENGQ,ENGKV,KV,PREP,FRONT,TAP stage;
+    class A,KH,QUANT,SCORE,SEL,D,E,F,LH sync;

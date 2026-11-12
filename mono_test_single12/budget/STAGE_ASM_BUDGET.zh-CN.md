@@ -2,7 +2,7 @@
 
 适用对象：`atom/models/deepseek_v41/mono/gfx1250/kernels/step.py` 的 `body`（214–216 行）层循环（267 行起）内的全部 stage。
 
-数据来自 `gprtool/`（2026-11-11）：TR=48、`--layers 2` 的构建，修复版 LLVM（`/app/llvm-upstream/build`）编译。寄存器数取自寄存器分配之后的 MIR（`llc -O2 -stop-before=prolog-epilog`），也就是分配器自己的活跃信息，不是分配前的估算。分析结论在 GPU 上做了运行时验证。工具用法见 `gprtool/README.zh-CN.md`，复现命令见文末。
+数据来自 ATOM 根目录下的 `gprtool/`（2026-11-11）：TR=48、`--layers 2` 的构建，修复版 LLVM（`/app/llvm-upstream/build`）编译。寄存器数取自寄存器分配之后的 MIR（`llc -O2 -stop-before=prolog-epilog`），也就是分配器自己的活跃信息，不是分配前的估算。分析结论在 GPU 上做了运行时验证。工具用法见 `/app/ATOM/gprtool/README.zh-CN.md`，复现命令见文末。
 
 ## 结论
 
@@ -148,7 +148,7 @@
 
 ## 3. 输入参数与寄存器绑定
 
-由 `gprtool` 的 replace 构建生成（`build/gpr/c_r0/bind.json`）。`v0` 只读；SGPR 是 tied 输入，asm 可以改写。trace 期常量写进 asm 文本。
+由 `gprtool` 的 replace 构建生成（`gprtool/build/gpr/c_r0/bind.json`）。`v0` 只读；SGPR 是 tied 输入，asm 可以改写。trace 期常量写进 asm 文本。
 
 | stage | 绑定 | 输入 SGPR 数 |
 |---|---|---|
@@ -216,7 +216,7 @@
 
 ## 6. 方法与验证
 
-`gprtool/gprtool.py` 的四个子命令（细节见 `gprtool/README.zh-CN.md`）：
+`/app/ATOM/gprtool/gprtool.py` 的四个子命令（细节见 `/app/ATOM/gprtool/README.zh-CN.md`）：
 
 - **analyze：** 在每个 stage 调用前后插一条不带操作数的 inline asm 标记，所以寄存器分配和原生 kernel 完全相同（VGPR 364，溢出条数一致）。FlyDSL 把 bitcode 交给修复版 llc，工具用同一条 llc 命令加 `-stop-before=prolog-epilog` 取分配后的 MIR，从每个基本块的 `liveins`（带 lane mask）往回推，得到每个标记处的活跃物理寄存器。
   - 早期版本的标记带一个 VGPR 输入，会扰动分配（VGPR scratch 读取从 11 条变成 69 条），已经改掉。
@@ -249,10 +249,10 @@
 ## 复现
 
 ```bash
-cd /app/ATOM/mono_test_single12
-python3 gprtool/gprtool.py analyze            # 原生 kernel 的活跃寄存器 -> build/gpr/analyze.json（约 20 s）
-python3 gprtool/gprtool.py contract           # 17 个 stage 替换后的预算 -> build/gpr/contract.json（约 15 min）
-HIP_VISIBLE_DEVICES=1 python3 gprtool/gprtool.py verify   # GPU 毒化验证 -> build/gpr/verify.json（约 2 min）
-HIP_VISIBLE_DEVICES=1 python3 gprtool/gprtool.py limit    # 可声明的 VGPR 上限 -> build/gpr/limit.json
-python3 gprtool/report.py > build/gpr/report.md          # 本文表 2、表 3 的 markdown
+cd /app/ATOM
+python3 gprtool/gprtool.py analyze            # 原生 kernel 的活跃寄存器 -> gprtool/build/gpr/analyze.json（约 20 s）
+python3 gprtool/gprtool.py contract           # 17 个 stage 替换后的预算 -> gprtool/build/gpr/contract.json（约 15 min）
+HIP_VISIBLE_DEVICES=1 python3 gprtool/gprtool.py verify   # GPU 毒化验证 -> gprtool/build/gpr/verify.json（约 2 min）
+HIP_VISIBLE_DEVICES=1 python3 gprtool/gprtool.py limit    # 可声明的 VGPR 上限 -> gprtool/build/gpr/limit.json
+python3 gprtool/report.py > gprtool/build/gpr/report.md          # 本文表 2、表 3 的 markdown
 ```

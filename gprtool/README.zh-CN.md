@@ -13,13 +13,15 @@
 | `mir.py` | 分配后 MIR 的解析：基本块、指令的 def/use、标记处的活跃集合、溢出统计、立即数常量判定 |
 | `regs.py` | MIR 寄存器名到 32 位单元（`v12`、`s5`、`vcc_hi`）的换算，区间格式化 |
 | `report.py` | 把 json 结果生成 markdown 表 |
+| `run_test.py` | mono kernel 的单 GPU 测试驱动（构建 `step.build` 的层循环、合成输入、检查结果、golden 对比），`probe.py` 在它之上挂钩子；来自 `mono_test_single12/run_test.py`，gprtool 只用 `--stagec native` |
+| `stage_inputs.py` | 扫描 ATOM kernel 源码，找出每个 stage 读取的 `c[...]` 键（replace 模式的 asm 输入） |
 
-结果写在 `build/gpr/`：`analyze.json`、`contract.json`、`verify.json`、`limit.json`，每次构建一个子目录（`plan.json`、`log.txt`、`post.mir`、`bind.json`、`info.json`）。
+结果写在 `gprtool/build/gpr/`（被 `.gitignore` 忽略）：`analyze.json`、`contract.json`、`verify.json`、`limit.json`，每次构建一个子目录（`plan.json`、`log.txt`、`post.mir`、`bind.json`、`info.json`）。
 
 ## 子命令
 
 ```bash
-cd /app/ATOM/mono_test_single12
+cd /app/ATOM
 python3 gprtool/gprtool.py analyze
 python3 gprtool/gprtool.py contract [--replace stage_A stage_C ...] [--limit 512] [--vtol 16] [--stol 16]
 HIP_VISIBLE_DEVICES=1 python3 gprtool/gprtool.py verify [--only 'stage_C#0:in'] [--vrange 0 256] [--no-sgpr]
@@ -28,7 +30,7 @@ python3 gprtool/report.py
 ```
 
 - **analyze**（只编译，约 20 s）：每个 stage 调用前后插 `; gpr: <stage>#<k>:in` / `:out` 两条不带操作数的 asm，分配结果与原生 kernel 相同。输出每个点的入口/出口活跃集合，以及贯穿 stage 的集合（入口活跃 ∩ 出口活跃 − stage 内重新定义的）。
-- **contract**（只编译，约 15 min）：`--replace` 里的 stage 每次调用都换成一条 asm，输入是该 stage 运行时读取的 `c[...]` 值和运行时参数（`budget/stage_inputs.py` 扫描源码得到）。绑定：`v0` = t（只读）；SGPR 从 s0 开始，64 位优先、偶数对齐，跳过预留寄存器，作为 tied output 声明（asm 可以改写）。然后：
+- **contract**（只编译，约 15 min）：`--replace` 里的 stage 每次调用都换成一条 asm，输入是该 stage 运行时读取的 `c[...]` 值和运行时参数（`stage_inputs.py` 扫描源码得到）。绑定：`v0` = t（只读）；SGPR 从 s0 开始，64 位优先、偶数对齐，跳过预留寄存器，作为 tied output 声明（asm 可以改写）。然后：
   1. 不声明 clobber 编译一次（R0），取每个 asm 之后仍活跃的物理寄存器个数 K；
   2. 保留窗口 = VGPR 堆顶部 K 个（加上 WWM 预留的 v256）、SGPR 顶部 K 个，其余全部逐个声明为 clobber；
   3. 搜索最小余量：先找全局 SGPR 余量，再找 VGPR 余量，最后逐点收回。判据：承载 SGPR 溢出的 WWM VGPR 不多于 R0，SGPR↔lane 指令数 ≤ R0 + `--stol`，VGPR scratch 指令数 ≤ R0 + `--vtol`。

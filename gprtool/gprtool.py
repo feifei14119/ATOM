@@ -34,7 +34,6 @@ sys.path.insert(0, str(HERE))
 import mir  # noqa: E402
 from regs import LLVM, ranges, split  # noqa: E402
 
-ROOT = HERE.parent
 TIER1 = ["stage_A", "stage_C", "stage_D", "stage_E", "stage_F_cluster", "stage_iq", "stage_iw", "stage_cgemm",
          "stage_crow", "stage_score_any", "stage_engkv", "front_B", "front_D", "ug_shared_early", "moe_ug", "moe_dn",
          "moe_dn_shared"]
@@ -354,7 +353,7 @@ def cmd_limit(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=("analyze", "contract", "verify", "limit"))
-    ap.add_argument("--work", default=str(ROOT / "build" / "gpr"))
+    ap.add_argument("--work", default=str(HERE / "build" / "gpr"))
     ap.add_argument("--llvm", type=Path, default=LLVM)
     ap.add_argument("--rows", type=int, default=48)
     ap.add_argument("--layers", type=int, default=2)

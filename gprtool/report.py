@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+HERE = Path(__file__).resolve().parent
 
 
 def load(work, name):
@@ -48,7 +48,7 @@ def analyze_table(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--work", default=str(ROOT / "build" / "gpr"))
+    ap.add_argument("--work", default=str(HERE / "build" / "gpr"))
     args = ap.parse_args()
     c, a, v, lim = (load(args.work, n) for n in ("contract", "analyze", "verify", "limit"))
     out = []

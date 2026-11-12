@@ -23,9 +23,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "budget"))
+sys.path.insert(0, str(HERE))
 
 from flydsl._mlir import ir  # noqa: E402
 from flydsl._mlir.dialects import arith, llvm  # noqa: E402

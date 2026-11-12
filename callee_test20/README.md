@@ -1,7 +1,9 @@
-# 在 ASM 文件中嵌入 HIP 代码块：设计方案
+# 在 ASM 文件中嵌入 HIP 代码块：设计与最小 demo
 
-状态：设计提案，尚未实现混合预处理器或 LLVM fragment 后端。
-记录日期：2026-11-11。
+状态：已补充 gfx1100 的受限混合预处理器、完整 ASM demo 和测试源码；通用 LLVM fragment 后端仍为设计提案。
+设计记录日期：2026-11-11；demo 更新日期：2026-11-12。
+
+**可运行 demo 见 [DEMO.md](DEMO.md)**，入口是 [kernel.s](kernel.s)，包含 `c = a + b*a` 与 `d = a - b/a` 两个 HIP 块，输出绑定到 v2/v7。已完成离线构建，没有执行单测或 GPU 测试。以下章节描述的类型、寄存器池和通用后端能力比当前 demo 更广，不能视为全部已实现。
 
 ## 1. 目标与工作方式
 
@@ -35,8 +37,9 @@ AMDGPU 汇编器 → .o → 链接 → 最终 code object
 ```
 
 详细的前端、LLVM 扩展、构建产物和验收方案见
-[IMPLEMENTATION.md](IMPLEMENTATION.md)。本文所有 `.hip.*` 指令、CLI、属性名称均为
-**拟议接口**，并不是现有 Clang、LLVM 或仓库工具已支持的功能。
+[IMPLEMENTATION.md](IMPLEMENTATION.md)。本文的通用接口仍为**拟议接口**；当前 demo
+实际支持的 `.hip.*` 子集见 [DEMO.md](DEMO.md)。这些指令由混合预处理器识别，
+Clang 和 LLVM assembler 不直接识别 `.hip.begin/end`。
 
 ## 2. 建议语法
 

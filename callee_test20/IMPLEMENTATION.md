@@ -1,6 +1,7 @@
 # 混合 ASM 预处理器与 LLVM fragment 后端：实现细节
 
-本文是 [README.md](README.md) 的实现方案，不表示工具或补丁已存在。
+本文是 [README.md](README.md) 中通用方案的实现设计，不表示通用后端补丁已存在。
+2026-11-12 已添加一个无需 LLVM 补丁的 gfx1100 受限 demo，实际实现和测试说明见 [DEMO.md](DEMO.md)。
 用户入口始终是 ASM 文件；HIP 只出现在 `.hip.begin` / `.hip.end` 内。
 内部不把手写 ASM 塞入 HIP wrapper，不在最终 kernel 中生成 device 函数调用。
 
@@ -12,14 +13,15 @@
 callee_test20/
   README.md
   IMPLEMENTATION.md
-  mixed_asm.py                 # 拟议：ASM 分段、合约解析、构建编排
+  mixed_asm.py                 # 已有 gfx1100 受限 demo；通用版本仍为拟议
   contract.py                  # 拟议：类型/寄存器/FP 配置及验证
   fragment_codegen/            # 拟议：LLVM 补丁或绑定版本的工具
   examples/                   # 拟议：完整混合 ASM kernel
   tests/                      # 拟议：合约、代码生成、完整 GPU 输出验收
 ```
 
-本次只保存设计文档，上述程序、示例和测试目录尚未创建。
+上面的目录结构描述通用扩展后的目标布局。当前已创建的 demo 使用 `kernel.s`、
+`mixed_asm.py`、`test_mixed_asm.py`、`verify.py` 和 `test.cpp`，具体范围见 DEMO.md。
 
 拟议命令：
 

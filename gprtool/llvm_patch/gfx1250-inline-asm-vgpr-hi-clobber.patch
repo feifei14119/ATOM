@@ -1,0 +1,77 @@
+diff --git a/llvm/lib/Target/AMDGPU/SIISelLowering.cpp b/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
+index cd7cb479a..018c888ca 100644
+--- a/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
++++ b/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
+@@ -19764,7 +19764,8 @@ SITargetLowering::getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI_,
+   auto [Kind, Idx, NumRegs] = AMDGPU::parseAsmConstraintPhysReg(Constraint);
+   if (Kind != '\0') {
+     if (Kind == 'v') {
+-      RC = &AMDGPU::VGPR_32_Lo256RegClass;
++      RC = Subtarget->has1024AddressableVGPRs() ? &AMDGPU::VGPR_32RegClass
++                                                : &AMDGPU::VGPR_32_Lo256RegClass;
+     } else if (Kind == 's') {
+       RC = &AMDGPU::SGPR_32RegClass;
+     } else if (Kind == 'a') {
+diff --git a/llvm/test/CodeGen/AMDGPU/inline-asm-clobber-vgpr-hi-gfx1250.ll b/llvm/test/CodeGen/AMDGPU/inline-asm-clobber-vgpr-hi-gfx1250.ll
+new file mode 100644
+index 000000000..4a1af2add
+--- /dev/null
++++ b/llvm/test/CodeGen/AMDGPU/inline-asm-clobber-vgpr-hi-gfx1250.ll
+@@ -0,0 +1,23 @@
++; RUN: llc -mtriple=amdgpu12.50-amd-amdhsa < %s | FileCheck %s
++
++; gfx1250 has 1024 VGPRs: clobbers of v256 and above must be honoured, both for
++; register allocation across the asm and for the kernel's VGPR count.
++
++; The only value live across the asm cannot use v[0:287].
++; CHECK-LABEL: .name: live_across_hi_clobber
++; CHECK: .vgpr_count: 290
++define amdgpu_kernel void @live_across_hi_clobber(ptr addrspace(1) %p) #0 {
++  %v = load i32, ptr addrspace(1) %p
++  call void asm sideeffect "; clobber v[0:287]", "~{v[0:31]},~{v[32:63]},~{v[64:95]},~{v[96:127]},~{v[128:159]},~{v[160:191]},~{v[192:223]},~{v[224:255]},~{v[256:287]}"()
++  store i32 %v, ptr addrspace(1) %p
++  ret void
++}
++
++; CHECK-LABEL: .name: clobber_v300
++; CHECK: .vgpr_count: 301
++define amdgpu_kernel void @clobber_v300() #0 {
++  call void asm sideeffect "; clobber v300", "~{v300}"()
++  ret void
++}
++
++attributes #0 = { "amdgpu-flat-work-group-size"="1,256" "amdgpu-waves-per-eu"="1,1" }
+diff --git a/llvm/test/CodeGen/AMDGPU/inline-asm-out-of-bounds-register.ll b/llvm/test/CodeGen/AMDGPU/inline-asm-out-of-bounds-register.ll
+index 5bb33a0b8..897429a6b 100644
+--- a/llvm/test/CodeGen/AMDGPU/inline-asm-out-of-bounds-register.ll
++++ b/llvm/test/CodeGen/AMDGPU/inline-asm-out-of-bounds-register.ll
+@@ -1,7 +1,9 @@
+-; RUN: not llc -mtriple=amdgpu7.04-amd-amdhsa -filetype=null %s 2>&1 | FileCheck -implicit-check-not=error %s
++; RUN: not llc -mtriple=amdgpu7.04-amd-amdhsa -filetype=null %s 2>&1 | FileCheck -check-prefixes=CHECK,LO256 -implicit-check-not=error %s
+ ; RUN: not llc -mtriple=amdgpu12.50-amd-amdhsa -filetype=null %s 2>&1 | FileCheck -implicit-check-not=error %s
+ 
+-; CHECK: error: could not allocate output register for constraint '{v256}'
++; gfx1250 has 1024 VGPRs, so v256 and above are valid fixed-register constraints there.
++
++; LO256: error: could not allocate output register for constraint '{v256}'
+ define void @out_of_bounds_vgpr32_def() {
+   %v = tail call i32 asm sideeffect "v_mov_b32 $0, -1", "={v256}"()
+   ret void
+@@ -19,7 +21,7 @@ define void @out_of_bounds_vgpr64_def_low_tuple() {
+   ret void
+ }
+ 
+-; CHECK: error: could not allocate input reg for constraint '{v256}'
++; LO256: error: could not allocate input reg for constraint '{v256}'
+ define void @out_of_bounds_vgpr32_use() {
+   %v = tail call i32 asm sideeffect "v_mov_b32 %0, %1", "=v,{v256}"(i32 123)
+   ret void
+@@ -31,7 +33,7 @@ define void @out_of_bounds_vgpr64_high_tuple() {
+   ret void
+ }
+ 
+-; CHECK: error: could not allocate input reg for constraint '{v[256:257]}'
++; LO256: error: could not allocate input reg for constraint '{v[256:257]}'
+ define void @out_of_bounds_vgpr64_low_tuple() {
+   tail call void asm sideeffect "; use %0", "{v[256:257]}"(i64 123)
+   ret void

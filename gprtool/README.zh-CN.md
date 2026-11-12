@@ -15,6 +15,7 @@
 | `report.py` | 把 json 结果生成 markdown 表 |
 | `run_test.py` | mono kernel 的单 GPU 测试驱动（构建 `step.build` 的层循环、合成输入、检查结果、golden 对比），`probe.py` 在它之上挂钩子；来自 `mono_test_single12/run_test.py`，gprtool 只用 `--stagec native` |
 | `stage_inputs.py` | 扫描 ATOM kernel 源码，找出每个 stage 读取的 `c[...]` 键（replace 模式的 asm 输入） |
+| `llvm_patch/` | `/app/llvm-upstream` 的修复：gfx1250 上 inline asm 的 `{vN}`/`~{vN}`（N ≥ 256）不再被限定在 v0–v255。基于 `/app/llvm-upstream` 的提交 `2e27f6b7`（上游 `1df311a6` 加 FlyDSL 补丁），在 LLVM 源码根目录执行 `git apply` |
 | `patches/` | `--patch` 用的 kernel 运行时补丁（实验用，不改 ATOM 源码） |
 
 结果写在 `gprtool/build/gpr/`（被 `.gitignore` 忽略）：`analyze.json`、`contract.json`、`verify.json`、`limit.json`，每次构建一个子目录（`plan.json`、`log.txt`、`post.mir`、`bind.json`、`info.json`）。

@@ -4,7 +4,8 @@
 mode "wrap":    `; gpr: <stage>#<k>:in` before and `:out` after each call of the TARGETS (the stage itself runs).
 mode "replace": each call of a stage in plan["replace"] becomes one asm `; gpr: <stage>#<k>` (the stage does not run):
                 the stage's runtime inputs (the c[...] keys it reads, its runtime positional arguments) are the asm's
-                inputs, bound to fixed registers (v0 = t, read-only: t lives through the whole kernel; SGPRs from s0:
+                inputs, bound to fixed registers (v0 = the hardware thread id, read-only: it lives through the whole kernel, the asm
+                computes t from it; SGPRs from s0:
                 the 64-bit pointers in aligned pairs, then the 32-bit scalars, tied to outputs of the same registers:
                 the asm may overwrite them); other calls are wrapped as in "wrap".
 A wrap marker has no operand (the native allocation unchanged). LLVM resets the VGPR MSB mode before an inline asm
@@ -135,7 +136,9 @@ def stage_operands(name, args, kwargs):
     c = args[0]
     table = SI.funcs(MODULE_OF[name])
     keys, _ = SI.keys_of(table[name], table, set())
-    ops = [("t", fx.Int32(c["t"]).ir_value(), "v")] if "t" in c else []
+    # the hardware thread id itself (one value, in v0 from the kernel entry), not the stage's t: that is a per-use
+    # opaque copy, and with it the thread id lives elsewhere across the asm (Lo256: next to the window it spills)
+    ops = [("tid", fx.Int32(fx.thread_idx.x).ir_value(), "v")]
     for k in sorted(keys):
         if k in CONST or k == "t" or k not in c:
             continue

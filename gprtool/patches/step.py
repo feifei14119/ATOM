@@ -80,6 +80,10 @@ _EPOCH = [0]
 _BASES = {}
 
 
+def fresh_t():   # a thread id copy per use: computed from v0 where it is used (never live across a stage's asm)
+    return hx.opaque_v(fx.thread_idx.x)
+
+
 def next_epoch():
     """A new table-read interval (handoffs, gpub / gwait, the front's sub-stages): see tbase."""
     _EPOCH[0] += 1
@@ -209,8 +213,7 @@ def entry_front(fp, sm, b, row, ne, topk):
     """A segment entry's attention front (front CTAs): the block state (dR / dy / dpre / dpost / dcomb) through the
     attention front of layer-table row `row` (its a* weights) -> axn / x8 / xs / the gates; R kept in LDS (first)."""
     nof = fx.Int32(0) != fx.Int32(0)
-    tq = hx.opaque_v(fx.thread_idx.x)
-    cu = dict(t=tq, b=b, w=tq // 32, l=tq % 32, sm=sm + FRONT_LDS_OFF, rms_eps=D.RMS_EPS, hc_eps=1e-6, norm_eps=D.RMS_EPS,
+    cu = LazyC(dict(t=fresh_t, w=lambda: fresh_t() // 32, l=lambda: fresh_t() % 32), b=b, sm=sm + FRONT_LDS_OFF, rms_eps=D.RMS_EPS, hc_eps=1e-6, norm_eps=D.RMS_EPS,
               R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"), comb=fptr(fp, "dcomb"),
               fnh=ltab(fp, row, "afnh")(), fnl=ltab(fp, row, "afnl")(), hsc=ltab(fp, row, "ahsc")(),
               hbs=ltab(fp, row, "ahbs")(), nw=ltab(fp, row, "anw")(), gate=ltab(fp, row, "gate")(),
@@ -305,51 +308,46 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                 # the target entry: SinglePassHCState.from_embeddings (R = 4 copies of the token's embedding, pre = (1, 0, 0, 0),
                 # y = 0, post = 0, comb = I: stage_block_state with W = 1), then layer 0's attention front (its a*: layer-table
                 # row TENTRY_ROW): x8 / xs / the attention gates, R kept in LDS (layer 0's FFN front: first = 0)
-                t = hx.opaque_v(fx.thread_idx.x)
                 b = hx.opaque_s(fx.block_idx.x)
                 sm = hx.lds_base()
                 TCNT = cnt + i64((NL + NDR) * LCB)
-                CX.stage_block_state(dict(t=t, b=b, aid=fptr(fp, "tids"), emb=fptr(fp, "emb"), noise=fptr(fp, "noise"),
+                CX.stage_block_state(dict(t=fresh_t(), b=b, aid=fptr(fp, "tids"), emb=fptr(fp, "emb"), noise=fptr(fp, "noise"),
                                           R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"),
                                           comb=fptr(fp, "dcomb")), TR, 1)
-                handoff(TCNT + i64(LY.TARGET_STATE), t, False)
+                handoff(TCNT + i64(LY.TARGET_STATE), fresh_t(), False)
                 if b < FS.FRONT_CTAS:
                     entry_front(fp, sm, b, TENTRY_ROW, FS.NE, FS.TOPK)
-                handoff(TCNT + i64(LY.TARGET_FRONT), t, False)
+                handoff(TCNT + i64(LY.TARGET_FRONT), fresh_t(), False)
             TRx = TRD if DRS else TR
             Lx = LD if DRS else L
             DSUF = "_d" if DRS else ""
             RNE, RTOPK = (DRAFT_NE, DRAFT_TOPK) if DRS else (FS.NE, FS.TOPK)   # the segment's router shape
             if fx.const_expr(DRS):
-                t = hx.opaque_v(fx.thread_idx.x)
                 b = hx.opaque_s(fx.block_idx.x)
                 sm = hx.lds_base()
                 TCNT = cnt + i64((NL + NDR) * LCB)
                 if fx.const_expr(part == "all"):
-                    if t == 0:
+                    if fresh_t() == 0:
                         hx.gstore(st + i64(b) * (32 * 8) + i64(25 * 8), hx.clock())
-                    ST.target(tp, t, b, sm, st, TCNT, recv, rank, head_d=4, ctx=fptr(fp, "ctxtab"), T=TR)
+                    ST.target(tp, fresh_t(), b, sm, st, TCNT, recv, rank, head_d=4, ctx=fptr(fp, "ctxtab"), T=TR)
                 # the draft context KV (main_proj .. ring) from the target loop's taps
                 # (the draft context KV runs inside the target sampling's exchanges: ST.target(ctx=...))
                 # the draft entry: the draft block's metadata from this step's verify, its block state, then draft stage 0's
                 # attention front (layer-table row NL + NDR)
                 if b == 0:
-                    CX.draft_meta(dict(t=t, verdict=ST.tptr(tp, "verdict"), rpos=fptr(fp, "rpos"), dgeom=fptr(fp, "dgeom"),
+                    CX.draft_meta(dict(t=fresh_t(), verdict=ST.tptr(tp, "verdict"), rpos=fptr(fp, "rpos"), dgeom=fptr(fp, "dgeom"),
                                        kmeta_d=fptr(fp, "kmeta_d"), kvw_d=fptr(fp, "kvw_d"), rpos_d=fptr(fp, "rpos_d")),
                                   TRD // DSPARK_W, DSPARK_W)
-                CX.stage_block_state(dict(t=t, b=b, aid=ST.tptr(tp, "anc"), emb=fptr(fp, "emb"), noise=fptr(fp, "noise"),
+                CX.stage_block_state(dict(t=fresh_t(), b=b, aid=ST.tptr(tp, "anc"), emb=fptr(fp, "emb"), noise=fptr(fp, "noise"),
                                           R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"),
                                           comb=fptr(fp, "dcomb")), TRD // DSPARK_W, DSPARK_W)
-                handoff(TCNT + i64(LY.DRAFT_STATE), t, False)
+                handoff(TCNT + i64(LY.DRAFT_STATE), fresh_t(), False)
                 if b < FS.FRONT_CTAS:
                     entry_front(fp, sm, b, NL + NDR, DRAFT_NE, DRAFT_TOPK)
-                handoff(TCNT + i64(LY.DRAFT_FRONT), t, False)
+                handoff(TCNT + i64(LY.DRAFT_FRONT), fresh_t(), False)
             for Ly in range(seg_lo, seg_hi):
                 kind = seg_kind
-                t = hx.opaque_v(fx.thread_idx.x)
                 b = hx.opaque_s(fx.block_idx.x)
-                w = t // 32
-                l = t % 32
                 sm = hx.lds_base()
                 def LC():   # this layer's handoff counters (cnt re-read: karg)
                     return karg("cnt") + oly(Ly) * LCB
@@ -364,8 +362,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                                                         "rsin").split()})
                 # t / w / l per access (a fresh thread id): computed once here they lived through the whole layer
                 # (VGPR scratch)
-                lz.update(t=lambda: hx.opaque_v(fx.thread_idx.x), w=lambda: hx.opaque_v(fx.thread_idx.x) // 32,
-                          l=lambda: hx.opaque_v(fx.thread_idx.x) % 32)
+                lz.update(t=fresh_t, w=lambda: fresh_t() // 32, l=lambda: fresh_t() % 32)
                 c = LazyC(lz, **dict(Lx, b=b, sm=sm, stx=stx, rank=rank, xcpol=0))
                 c = lazy(c, scale=lambda: karg("scale"), rpos=lambda: fptr(fp, "rpos" + DSUF))   # each row's RoPE position (int64 [T]), the product's cache.rope_positions
                 # the key geometry: step metadata, the layer's selection owner tables and ring start (a WINDOW layer: n_sel 0 table)
@@ -388,7 +385,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                 def stamp(k):   # the layer-time stamps only: 0 (layer 0 start), 12 (layer 1 start), 18 (a layer's end)
                     if fx.const_expr(k not in (0, 12, 18)):
                         return
-                    if t == 0:
+                    if fresh_t() == 0:
                         hx.gstore(karg("st") + i64(b) * (32 * 8) + i64(k * 8), hx.clock())
 
                 if Ly == 0:
@@ -399,9 +396,9 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                     if (ltab(fp, Ly, "lflags")() & fx.Int64(128)) != fx.Int64(0):
                         ES.stage_engq(cwith(c, engemb=ltab(fp, Ly, "engemb")(), eng8=fptr(fp, "eng8"), engs=fptr(fp, "engs")))
                 stage_A(c)
-                pf_rows(c["wqb"] + i64(b) * (16 * QL), QL, 16, QL, t)
-                pf_rows(c["wqb"] + i64(b + CTAS) * (16 * QL), QL, 16, QL, t)
-                handoff(LC(), t, True)   # LY.ATTN_A (offset 0)
+                pf_rows(c["wqb"] + i64(b) * (16 * QL), QL, 16, QL, fresh_t())
+                pf_rows(c["wqb"] + i64(b + CTAS) * (16 * QL), QL, 16, QL, fresh_t())
+                handoff(LC(), fresh_t(), True)   # LY.ATTN_A (offset 0)
                 if fx.const_expr((kind & 1) != 0):   # the next layer's Engram kv = emb . wkv^T (read by this layer's attention front)
                     if (ltab(fp, Ly, "lflags")() & fx.Int64(128)) != fx.Int64(0):
                         ES.stage_engkv(cwith(c, eng8=fptr(fp, "eng8"), engs=fptr(fp, "engs"), engw=ltab(fp, Ly, "engw")(),
@@ -421,7 +418,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                         if hascomp:   # the compressor's wkv_gate GEMM (compressor)
                             CS.stage_cgemm(lazy(c, cwkv=lambda: ltab(fp, Ly, "cwkv")(), axn=lambda: fptr(fp, "axn"),
                                                 cpart=lambda: fptr(fp, "cpart")), r1)
-                handoff(LC() + i64(LY.KV_C), t, True)
+                handoff(LC() + i64(LY.KV_C), fresh_t(), True)
                 if fx.const_expr((kind & 1) != 0):   # iquant, then its own handoff (the scorer reads iq_out / iw_out; lc + 4 is free)
                     if isidx:
                         IS.stage_iquant(lazy(c, **{n: (lambda n=n: fptr(fp, n)) for n in ("iq", "iwp", "iq_out", "iqs_out", "iw_out")}))
@@ -435,7 +432,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                                                                                                 "bstride").split()})
                             CS.stage_crow(cc, r1b)
                             CS.stage_cring(cc, r1b)
-                        handoff(LC() + i64(LY.INDEX_QUANT), t, True)
+                        handoff(LC() + i64(LY.INDEX_QUANT), fresh_t(), True)
                         if ltab(fp, Ly, "ibat")() != fx.Int64(0):   # a layer whose table has no scorer inputs skips it
                             # FULL: the scores of every visible index row, then the top-512 -> isel / irow (the attention's ksel)
                             cs_ = lazy(c, **{n: (lambda n=n: ltab(fp, Ly, n)()) for n in ("ibat ibound iplane btab ilog isel irow "
@@ -448,24 +445,24 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                             isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)      # bit 6: REINDEX (layer 20's candidates)
                             # one instance of the scorer (FULL and REINDEX, isrx traced) and of the selection code for every pass (I-cache)
                             SC.stage_score_any(cs_, isrx)
-                            handoff(LC() + i64(LY.SCORE), t, True)
+                            handoff(LC() + i64(LY.SCORE), fresh_t(), True)
                             npass = isrx.select(fx.Int32(IDX_LEVELS), cs_["iprod"].select(fx.Int32(2 * IDX_LEVELS), fx.Int32(IDX_LEVELS)))
                             for pi in range(npass):   # sel or rx levels, then (layer 20) the blk levels
                                 pmode = isrx.select(fx.Int32(TK.MODE_RX), (pi < IDX_LEVELS).select(fx.Int32(TK.MODE_SEL), fx.Int32(TK.MODE_BLK)))
                                 plev = pi % IDX_LEVELS
                                 TK.stage_select_any(lazy(cs_, b=ob), plev, IDX_LEVELS, pmode)
-                                handoff(olc() + i64(LY.SELECT0) + i64(pi) * 4, t, True)
+                                handoff(olc() + i64(LY.SELECT0) + i64(pi) * 4, fresh_t(), True)
                 stage_D(c)
-                pf_rows(c["woa"] + i64(b // 4) * (32 * KWOA) + i64((b % 4) * 1024), KWOA, 32, 1024, t)
-                handoff(LC() + i64(LY.ATTN_D), t, True)
+                pf_rows(c["woa"] + i64(b // 4) * (32 * KWOA) + i64((b % 4) * 1024), KWOA, 32, 1024, fresh_t())
+                handoff(LC() + i64(LY.ATTN_D), fresh_t(), True)
                 stage_E(c)
-                pf_rows(c["wob"] + i64(b // 4) * (80 * NWOA) + i64((b % 4) * 512), NWOA, 80, 512, t)
-                handoff(LC() + i64(LY.ATTN_E), t, True)
+                pf_rows(c["wob"] + i64(b // 4) * (80 * NWOA) + i64((b % 4) * 512), NWOA, 80, 512, fresh_t())
+                handoff(LC() + i64(LY.ATTN_E), fresh_t(), True)
                 stage_F_cluster(c)
                 gpu.barrier()
                 par = Ly % 2
                 tp_allreduce(cwith(c, ytgt=fptr(fp, 'y1')), par * 2, 2 * Ly + 1)
-                gpub(LC() + i64(LY.TP1_GROUPS), b, t)
+                gpub(LC() + i64(LY.TP1_GROUPS), b, fresh_t())
                 # the two fronts with one copy of the code: pass 0 = FFN front, MoE, TP2; pass 1 = attention front
                 for hf in range(hx.opaque_s(fx.Int32(2))):
                     if hf == 0:
@@ -473,16 +470,16 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                     # a front CTA (g, p) reads y (TP1 / TP2's output) only in its cols 320p.. -- the 16 TP CTAs 16p..16p+15:
                     # it waits for their column-group count, not a device-wide handoff (the idle CTAs do not wait at all)
                     if ob() < FS.FRONT_CTAS:
-                        gwait(olc() + (hf == 0).select(i64(LY.TP1_GROUPS), i64(LY.TP2_GROUPS)), ob(), t)
+                        gwait(olc() + (hf == 0).select(i64(LY.TP1_GROUPS), i64(LY.TP2_GROUPS)), ob(), fresh_t())
                     if ob() < FS.FRONT_CTAS:
                         isf = hf == 0
 
                         def fsel(n0, n1):
                             ix = isf.select(fx.Int32(FPTRS.index(n0) * 8), fx.Int32(FPTRS.index(n1) * 8))
                             return hx.sload64(tbase(fp) + i64(ix))
-                        tq = hx.opaque_v(fx.thread_idx.x)
-                        # the front's pointers are read at their uses (lazy): all read here they lived through the whole front
-                        cu = lazy(dict(t=tq, w=tq // 32, l=tq % 32, sm=sm + FRONT_LDS_OFF, rms_eps=D.RMS_EPS, hc_eps=1e-6, norm_eps=D.RMS_EPS,
+                        # the front's pointers and thread id are read at their uses (lazy): all read here they lived through
+                        # the whole front
+                        cu = lazy(dict(sm=sm + FRONT_LDS_OFF, rms_eps=D.RMS_EPS, hc_eps=1e-6, norm_eps=D.RMS_EPS,
                                        isffn=isf, xs32=hf != 0, merge=isf, hdev=True, ne=RNE, topk=RTOPK),
                                   **{k: (lambda n0=n0, n1=n1: fsel(n0, n1)) for k, (n0, n1) in dict(
                                       R=("R", "Rout"), y=("y1", "y2"), pre=("pre", "npre"), post=("post", "npost"), comb=("comb", "ncomb"),
@@ -492,6 +489,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                                       fnh=("fnh", "afnh"), fnl=("fnl", "afnl"), hsc=("hsc", "ahsc"), hbs=("hbs", "ahbs"),
                                       nw=("nw", "anw")).items()},
                                   **{k: (lambda k=k: fptr(fp, k)) for k in "part plog cand cands ids wts".split()},
+                                  t=fresh_t, w=lambda: fresh_t() // 32, l=lambda: fresh_t() % 32,
                                   b=ob, gate=lambda: ltab(fp, Ly, "gate")(), gbias=lambda: ltab(fp, Ly, "gbias")(),
                                   # the last layer of each segment writes the head input: target -> xh, draft -> dh
                                   xn=lambda: ((hf != 0) & (Ly == (NL + NDR - 1 if DRS else NL - 1))).select(ST.tptr(tp, "dh") if DRS else fptr(fp, "xh"), fsel("xn", "axn")),
@@ -510,60 +508,56 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                                 if isf:
                                     hx.wait_storecnt0()
                                     gpu.barrier()
-                                    if tq == 0:
+                                    if fresh_t() == 0:
                                         hx.atomic_add(olc() + i64(LY.X8_PUB), 1)
                         FS.front_any(cu, x8pub)
                     if fx.const_expr(MS.sh_early((TRx + MS.MAXTOK - 1) // MS.MAXTOK)):
                         # the FFN front's idle CTAs: the shared expert's UG, K split over SHE_CTAS CTAs a unit, once every front
                         # CTA's x8 is out (the front leaves most CTAs idle)
                         if (hf == 0) & (ob() >= FS.FRONT_CTAS) & (ob() < FS.FRONT_CTAS + ((TRx + MS.MAXTOK - 1) // MS.MAXTOK) * MS.NUG * MS.SHE_CTAS):
-                            tq3 = hx.opaque_v(fx.thread_idx.x)
-                            if tq3 == 0:
+                            if fresh_t() == 0:
                                 hx.wait_count(lambda: olc() + i64(LY.X8_PUB), FS.FRONT_CTAS, 6)
                             gpu.barrier()
-                            ce = lazy(dict(t=tq3, w=tq3 // 32, l=tq3 % 32, sm=sm + FRONT_LDS_OFF, NP=TRx * RTOPK, topk=RTOPK),
-                                      b=ob, x8=lambda: fptr(fp, "fx8"), xs=lambda: fptr(fp, "fxs"), shplane=lambda: ltab(fp, Ly, "shplane")(),
+                            ce = lazy(dict(sm=sm + FRONT_LDS_OFF, NP=TRx * RTOPK, topk=RTOPK),
+                                      t=fresh_t, w=lambda: fresh_t() // 32, l=lambda: fresh_t() % 32, b=ob, x8=lambda: fptr(fp, "fx8"), xs=lambda: fptr(fp, "fxs"), shplane=lambda: ltab(fp, Ly, "shplane")(),
                                       mid8=lambda: fptr(fp, "mid8"), midc=lambda: fptr(fp, "midc"), out=lambda: fptr(fp, "mout"))
                             MS.ug_shared_early(ce, ob() - FS.FRONT_CTAS)
                     if hf == 0:
                         iprefetch(16)   # the routed MoE
-                        handoff(olc() + i64(LY.FRONT), t, True)
-                        tq2 = hx.opaque_v(fx.thread_idx.x)
-                        cm = LazyC({'shplane': (lambda Ly=Ly: ltab(fp, Ly, 'shplane')()),   # (re-read at its uses: not live across the layer)
+                        handoff(olc() + i64(LY.FRONT), fresh_t(), True)
+                        cm = LazyC({'t': fresh_t, 'w': lambda: fresh_t() // 32, 'l': lambda: fresh_t() % 32,'shplane': (lambda Ly=Ly: ltab(fp, Ly, 'shplane')()),   # (re-read at its uses: not live across the layer)
                                     'b': ob, 'shcnt': (lambda: olc() + i64(LY.SHARED_DOWN)),
                                     **{k: (lambda n=n: ltab(fp, Ly, n)()) for k, n in dict(w13="mw13", s13="ms13", w2="mw2", s2="ms2").items()},
                                     **{k: (lambda n=n: fptr(fp, n)) for k, n in dict(x8="fx8", xs="fxs", ids="ids", wts="wts", out="mout",
                                                                                       mid8="mid8", midc="midc").items()}},
-                                   t=tq2, w=tq2 // 32, l=tq2 % 32, sm=sm + FRONT_LDS_OFF, NP=TRx * RTOPK, topk=RTOPK, nexp_max=96)
+                                   sm=sm + FRONT_LDS_OFF, NP=TRx * RTOPK, topk=RTOPK, nexp_max=96)
                         MS.moe(cm, olc() + i64(LY.MOE_UG))
                         gpu.barrier()
-                        handoff(olc() + i64(LY.MOE_DONE), t, True)
+                        handoff(olc() + i64(LY.MOE_DONE), fresh_t(), True)
                         # TP2 payload = the MoE output rows, result -> y2 (the attention front's y)
-                        MS.moe_combine(dict(t=hx.opaque_v(fx.thread_idx.x), b=ob(), out=fptr(fp, "mout"), topk=RTOPK), TRx, sm)
+                        MS.moe_combine(dict(t=fresh_t(), b=ob(), out=fptr(fp, "mout"), topk=RTOPK), TRx, sm)
                         tp_allreduce(lazy(c, b=ob, tpout=lambda: fptr(fp, "tp2out"), ytgt=lambda: fptr(fp, "y2")), par * 2 + 1, 2 * Ly + 2)
-                        gpub(olc() + i64(LY.TP2_GROUPS), ob(), t)
-                handoff(LC() + i64(LY.LAYER_END), t, True)
+                        gpub(olc() + i64(LY.TP2_GROUPS), ob(), fresh_t())
+                handoff(LC() + i64(LY.LAYER_END), fresh_t(), True)
                 if fx.const_expr((kind & 1) != 0):   # the target body: the draft context taps (read before the next front rewrites aRout)
                     if (ltab(fp, Ly, "lflags")() & fx.Int64(16)) != fx.Int64(0):
                         tap0 = NL - 4
-                        CX.stage_tap1(dict(t=hx.opaque_v(fx.thread_idx.x), b=b, aux8=fptr(fp, "aux8"), auxs=fptr(fp, "auxs")),
+                        CX.stage_tap1(dict(t=fresh_t(), b=b, aux8=fptr(fp, "aux8"), auxs=fptr(fp, "auxs")),
                                       TRx, Ly - tap0, fptr(fp, "aRout"))
                 stamp(18)
         if fx.const_expr(part == "target"):   # the step's first launch ends with the head, sampling and verification
-            t = hx.opaque_v(fx.thread_idx.x)
             b = hx.opaque_s(fx.block_idx.x)
             sm = hx.lds_base()
-            if t == 0:
+            if fresh_t() == 0:
                 hx.gstore(st + i64(b) * (32 * 8) + i64(25 * 8), hx.clock())
-            ST.target(tp, t, b, sm, st, cnt + i64((NL + NDR) * LCB), recv, rank, head_d=4,
+            ST.target(tp, fresh_t(), b, sm, st, cnt + i64((NL + NDR) * LCB), recv, rank, head_d=4,
                      ctx=_ctxtab(fp, NDR), T=TR)
         if fx.const_expr(NDR > 0 and part != "target"):
-            t = hx.opaque_v(fx.thread_idx.x)
             b = hx.opaque_s(fx.block_idx.x)
             sm = hx.lds_base()
-            if t == 0:
+            if fresh_t() == 0:
                 hx.gstore(st + i64(b) * (32 * 8) + i64(26 * 8), hx.clock())
-            ST.draft(tp, t, b, sm, st, cnt + i64((NL + NDR) * LCB), recv, rank, head_d=4)
+            ST.draft(tp, fresh_t(), b, sm, st, cnt + i64((NL + NDR) * LCB), recv, rank, head_d=4)
         tp_epoch_end(fp, tep)
         hx.TOFLAG[0] = None   # (the counter pointer belongs to this kernel's trace only)
         _BASES.clear()   # (this trace's values: FlyDSL checks the globals launch reaches are unchanged between calls)

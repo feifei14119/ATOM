@@ -32,7 +32,7 @@ python3 gprtool/report.py
 ```
 
 - **analyze**（只编译，约 20 s）：每个 stage 调用前后插 `; gpr: <stage>#<k>:in` / `:out` 两条不带操作数的 asm，分配结果与原生 kernel 相同。输出每个点的入口/出口活跃集合，以及贯穿 stage 的集合（入口活跃 ∩ 出口活跃 − stage 内重新定义的）。
-- **contract**（只编译，约 15 min）：`--replace` 里的 stage 每次调用都换成一条 asm，输入是该 stage 运行时读取的 `c[...]` 值和运行时参数（`stage_inputs.py` 扫描源码得到）。绑定：`v0` = t（只读）；SGPR 从 s0 开始，64 位优先、偶数对齐，跳过预留寄存器，作为 tied output 声明（asm 可以改写）。然后：
+- **contract**（只编译，约 15 min）：`--replace` 里的 stage 每次调用都换成一条 asm，输入是该 stage 运行时读取的 `c[...]` 值和运行时参数（`stage_inputs.py` 扫描源码得到）。绑定：`v0` = 硬件线程号 tid（`thread_idx.x` 本身，只读，每个 asm 都绑定；asm 自己从 v0 得到 t）；SGPR 从 s0 开始，64 位优先、偶数对齐，跳过预留寄存器，作为 tied output 声明（asm 可以改写）。然后：
   1. 不声明 clobber 编译一次（R0）。**禁止任何 SGPR spill**（spill 到 VGPR lane 或 scratch 都不行）：R0 只要有一条就报错退出（rc 2），并打印每条 spill 所在区域和被 spill 的值的定义指令。原生 ATOM 源码会出现这种情况，需要加 `--patch patches/zero_sgpr_spill.py`。
   2. 取每个 asm 之后仍活跃（跨 asm）的物理寄存器个数 K。保留窗口：VGPR 为堆顶部 K 个（加 `--vslack`），SGPR 为可用 SGPR 顶部 K 个；其余寄存器全部逐个声明为 clobber。
   3. SGPR 窗口取不产生任何 SGPR spill 的最小全局余量，再逐点收回。VGPR 窗口不加余量，放不下的由 LLVM 生成 scratch，工具给出警告，并按区域列出 scratch 指令数。最终构建再检查一遍：SGPR spill 为 0，跨 asm 活跃的普通寄存器都在窗口内。
@@ -40,7 +40,7 @@ python3 gprtool/report.py
   每个调用点输出：调用前和调用后的活跃寄存器（最终构建）、跨调用必须保留的个数（R0 → 最终）、入参绑定的 VGPR/SGPR 个数和具体寄存器、保留窗口、asm 可用的 VGPR/SGPR 区间（包括可改写的 SGPR 入参）、可 clobber 的 `vcc_lo`/`vcc_hi`/`scc`、该点之后的 VGPR scratch 指令数。
 - **verify**（GPU，约 2 min）：用 analyze 构建，在每个标记处把判为"死"的寄存器写成 `0xDEAD0000 + n`（SGPR 是 `0xDEAD8000 + n`），并逐个声明为 clobber，然后和 golden 对比；负对照（`--negative`，默认 `stage_E#0:in`）把活跃的 VGPR 也毒化，应当出错。`--only`、`--vrange`、`--no-sgpr` 用来二分定位问题点。
 - **limit**（GPU）：在 `--at` 处声明 clobber v(n−1)，看 kernel 的 VGPR 数变成 n 后能否启动。
-- **`--patch FILE`**（所有子命令）：构建时在 trace 之前执行一个 python 文件，对 kernel 模块做运行时替换，不改 ATOM 源码，用来评估源码改动对寄存器的影响。`patches/zero_sgpr_spill.py` 用 `patches/step.py`（`kernels/step.py` 的修改副本）替换 step 模块，并给 front 子阶段加区间边界。改法：kernarg 和指针表按区间、按基本块重新读取（不透明基址）；层循环和内层循环里用到的 `b` / `lc` / `Ly` 都用不透明副本，避免被 LICM 提到循环外；上下文改为用到时才读。效果：原生和 R0 的 SGPR spill 都为 0，原生 SGPR 峰值从 104 降到 86，GPU 结果与原生一致（两者都有同样的间歇性失败，不是补丁引入的）。旧的 `patches/sload_epoch.py`（只做到 17 条）：让 step.py 读指针表时以 handoff / front 子阶段为界重新读取（不跨区间合并，也不被提到层循环外），层循环里的 front 改成用到时才读指针。效果：原生 SGPR 溢出从 58 条写入降到 17 条（R0 从 75 条降到 18 条），`front_B#1` 的 asm SGPR 从 7 个增加到 44 个，`front_D#0` 从 24 个增加到 52 个（结果在 `build/gpr_patch/`）。
+- **`--patch FILE`**（所有子命令）：构建时在 trace 之前执行一个 python 文件，对 kernel 模块做运行时替换，不改 ATOM 源码，用来评估源码改动对寄存器的影响。`patches/zero_sgpr_spill.py` 用 `patches/step.py`（`kernels/step.py` 的修改副本）替换 step 模块，并给 front 子阶段加区间边界。改法：kernarg 和指针表按区间、按基本块重新读取（不透明基址）；层循环和内层循环里用到的 `b` / `lc` / `Ly` 都用不透明副本，避免被 LICM 提到循环外；上下文改为用到时才读。效果：原生和 R0 的 SGPR spill 都为 0，原生 VGPR scratch 从 33 条降到 10 条，GPU 结果与原生一致（两者都有同样的间歇性失败，不是补丁引入的）。旧的 `patches/sload_epoch.py`（只做到 17 条）：让 step.py 读指针表时以 handoff / front 子阶段为界重新读取（不跨区间合并，也不被提到层循环外），层循环里的 front 改成用到时才读指针。效果：原生 SGPR 溢出从 58 条写入降到 17 条（R0 从 75 条降到 18 条），`front_B#1` 的 asm SGPR 从 7 个增加到 44 个，`front_D#0` 从 24 个增加到 52 个（结果在 `build/gpr_patch/`）。
 
 ## asm 必须遵守的规则（都是用本工具实测得到的）
 
@@ -62,6 +62,7 @@ python3 gprtool/report.py
 ## 已知限制
 
 - 窗口放在寄存器堆顶部；改成 R0 中实际用到的那组寄存器反而更差，因为贪心分配器不会照搬 R0 的解。
-- 剩下的 VGPR scratch 主要来自硬件线程 id（入口时的 v0）：它贯穿整个 kernel，其副本是 `VGPR_32_Lo256` 的 inline asm 操作数，贪心分配器会把它 spill 到 scratch，在各区域恢复。原生 kernel 本身也有约 33 条。加大 VGPR 窗口（`--vslack`）不能减少；在窗口里另外保留低区寄存器只能从 36 条降到 26 条。
+- 线程号的处理决定了 VGPR scratch 的多少。`opaque_v` 的 `"=v,0"` 操作数只能放在 v0–v255，而低区在 asm 处几乎全被 clobber，所以凡是跨 asm 存活、又要喂给 `opaque_v` 的值都会被 spill。因此有两条做法：asm 绑定硬件线程号本身（整个 kernel 里只有这一个值，常驻 v0）；补丁版 step.py 里，线程号副本一律用到时才现做（`fresh_t()`），不长期持有。不能直接到处用 `thread_idx.x`，否则相同的比较会被合并成长期存活的 SGPR mask，产生 SGPR spill。这样做之后 contract 的 scratch 是 14 条：分配器在未替换的原生 stage 内部临时把 tid 挪出 v0。
+- 契约表里的 scratch 对应 asm 用满“可用”寄存器的情形；asm 实际 clobber 得少时更少（每个 asm 只 clobber 6 个 VGPR 时为 0 条）。
 - 数字适用于 `--replace` 列出的那组 stage 同时替换的情形，换一组要重新跑 contract。
 - 2026-11-11 跑 `limit --n 1024` 时 GPU 驱动卡死，测试进程停在 D 状态，需要复位驱动。复位后再跑 GPU 子命令。

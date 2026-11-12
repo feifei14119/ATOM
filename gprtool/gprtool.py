@@ -3,7 +3,7 @@
 
   analyze   the native kernel (every stage wrapped by markers): registers live just before / after each insertion
             point and through each stage, from post-RA MIR (the register allocator's own liveness)
-  contract  every stage of --replace becomes one asm with its real inputs (v0 = t read-only, SGPRs tied: the asm
+  contract  every stage of --replace becomes one asm with its real inputs (v0 = hardware thread id, read-only; SGPRs tied: the asm
             may overwrite them) that clobbers every register outside its kept window. SGPR spill (to VGPR lanes or
             to scratch) is forbidden: none in the build with no clobber (else an error with the spill sites), none
             in the final one. Kept window per insertion point: VGPRs = those live across it (+ --vslack; the top of

@@ -93,6 +93,33 @@ HIP 的 RDC device-only 编译中，`clang++ -c` 可以输出 LLVM bitcode。因
 
 C 的机器指令没有被提取到 A，也没有寄存器重映射或返回改写。原生 C 函数以独立符号保留。
 
+### 为什么需要 `llc`
+
+`llc` 是 LLVM 的后端编译器：输入 LLVM IR（`.ll` 文本或 `.bc` bitcode），输出目标机器的汇编（`.s`）或目标文件（`.o`）。它只负责编译器后半段，即指令选择、寄存器分配、调度和指令编码，不处理 HIP/C++ 源码。
+
+| 工具 | 输入 | 输出 |
+|---|---|---|
+| `clang++` | HIP/C++ 源码 | LLVM IR，或者完整走完后端得到机器码 |
+| `llc` | LLVM IR | 汇编或目标文件 |
+| `llvm-mc` | 手写汇编 | 目标文件，只做编码，不做优化和寄存器分配 |
+| `ld.lld` | 多个 `.o` | 最终 code object |
+
+`asm_test00` 全是手写汇编，只用 `llvm-mc` 就够了。嵌入 HIP 后需要 `llc`，原因是 `ld.lld` 要的是一个**可重定位目标文件**（ELF 类型 `REL`），里面放着已经编码好的 C 的机器码，等待和 A、B 链接。而 HIP 的常规编译给不出这样的文件：
+
+- **不加 `-fgpu-rdc`**：clang 直接链接出完整的 code object（`DYN`），不能再和其他 `.o` 链接。
+- **加 `-fgpu-rdc -c`**（本例的可分离编译模式）：clang 输出的是 LLVM bitcode。设备代码的机器码生成被推迟到链接时统一完成，所以 `kernel_C.bc` 里还没有 gfx1250 指令。
+
+因此 Makefile 用 `llc` 把 `kernel_C.bc` 编成 `kernel_C.raw.o`（`REL`，真正的 gfx1250 指令），再交给 `ld.lld`。另外用同样的后端配置导出 `kernel_C.native.s`，供 `audit_c.py` 检查 C 的寄存器接口。
+
+`llc` 不是必须的：clang 内部有同一个后端，可以直接编译 bitcode。
+
+```bash
+/opt/rocm/lib/llvm/bin/clang -target amdgcn-amd-amdhsa -mcpu=gfx1250 -mcode-object-version=6 -O2 \
+    -c build/kernel_C.bc -o build/kernel_C.raw.o     # 审计用的汇编：把 -c 换成 -S
+```
+
+2026-11-13 在本机实测，这条命令得到的也是 `REL` 文件，`kernel_C` 的四条指令与 `llc` 的输出完全相同。有些 ROCm 安装（例如本机的 `/opt/rocm/lib/llvm/bin`）没有附带 `llc`，可以用这种方式代替。
+
 ## B 的自定义接口和 C 的编译器接口
 
 | 接口 | 输入 | 返回结果 | 返回地址 |
@@ -203,3 +230,23 @@ C：0x1770 + 0x4a8 = 0x1c18
 ```
 
 链接布局可以变化，地址由重定位重新计算。本例仅支持一个 block 和当前简单的、无 scratch/嵌套调用/隐式 dispatch 参数的 C。
+
+## 2026-11-13 另一台机器上的验证记录（AMD LLVM 23）
+
+在 `/app/ATOM/asm_test01` 执行了构建、`make check` 和 `make run`，**离线检查和 GPU 测试都通过**：
+
+```text
+HIP C build ABI: v0/v1 -> v0, return s[30:31], no scratch; empty metadata identified
+Static PASS: independent ASM A/B and HIP C native objects; both call relocations resolved
+GPU 1: AMD Radeon Graphics (gfx1250)
+GPU PASS: 15 launches, 1098 values, out=3*(a+b)+8, input/guards unchanged
+```
+
+这台机器的工具链和上面的构建记录不同：`/opt/rocm/lib/llvm/bin` 是 AMD clang 23.0.0git（提交 `d177931`），而且没有 `llc`。为此做了以下处理，源文件和 Makefile 都没有修改：
+
+1. **`llc`**：建了 `/tmp/asm_test_llvm` 目录，其中 ROCm 的 LLVM 工具全部用符号链接，`llc` 取自同一提交编译的 `/app/llvm-project/build/bin/llc`。运行时加 `make LLVM=/tmp/asm_test_llvm`。
+2. **CFI**：新版 clang 给设备函数加了 `uwtable` 属性，`llc` 随之生成 `.cfi_*` 伪指令和 `.eh_frame` 段。`audit_c.py` 因此误判"函数体改变"，并把 `.eh_frame` 对本文件 `.text` 的重定位误判为"外部引用"。处理方法是在 make 命令行覆盖 `HIP_FLAGS`，追加 `-fno-unwind-tables -fno-asynchronous-unwind-tables`。
+3. **资源符号名**：新版 `llc` 输出的是 `.set .Lkernel_C.num_vgpr, 2`，多了 `.L` 前缀，而 `audit_c.py` 查找的是 `kernel_C.num_vgpr`。处理方法是先生成 `build/kernel_C.native.s`，再用 `sed 's/\.set \.Lkernel_C\./.set kernel_C./'` 去掉前缀，数值不变。
+4. **GPU**：GPU 0 当时被其他任务占满，所以用 `DEVICE=1`。
+
+C 的机器码和资源与 LLVM 22 下的完全一致：`v_mad_u32 v0, v1, v0, 7`，`num_vgpr=2`，`numbered_sgpr=32`，scratch 为 0。要让新版工具链直接 `make` 通过，需要做两处改动：Makefile 的 `HIP_FLAGS` 加上第 2 条的两个参数；`audit_c.py` 的资源正则兼容 `.L` 前缀（例如 `\.set \.?L?kernel_C\.`）。
